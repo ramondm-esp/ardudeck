@@ -271,8 +271,16 @@ pub struct FuselageSpec {
     pub area_cd: [f64; 3],
 }
 
+/// No fuselage unless one is described.
+///
+/// This used to default to a plausible small-aircraft fuselage, which is the
+/// same silent-default failure the airfoil lookup already refuses to make: an
+/// airframe that omits the block then flies with someone else's fuselage bolted
+/// to it and is never told. It cost an hour on a bare flat plate whose drag
+/// coefficient came out at 2.07 against a table value of 1.47, with the whole
+/// difference being an invented fuselage. A missing fuselage means no fuselage.
 fn default_area_cd() -> [f64; 3] {
-    [0.02, 0.10, 0.12]
+    [0.0, 0.0, 0.0]
 }
 
 impl Default for FuselageSpec {
@@ -334,7 +342,8 @@ pub struct Airframe {
 #[derive(Debug)]
 pub enum BuildError {
     UnknownAirfoil(String),
-    NoRotors,
+    /// Neither a rotor nor a lifting surface: nothing to simulate.
+    NothingToFly,
     BadMass(f64),
     BadInertia([f64; 3]),
 }
@@ -343,7 +352,9 @@ impl std::fmt::Display for BuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BuildError::UnknownAirfoil(n) => write!(f, "airfoil '{n}' is referenced but not defined"),
-            BuildError::NoRotors => write!(f, "airframe has no rotors"),
+            BuildError::NothingToFly => {
+                write!(f, "airframe has neither rotors nor lifting surfaces")
+            }
             BuildError::BadMass(m) => write!(f, "mass must be positive, got {m}"),
             BuildError::BadInertia(i) => write!(f, "inertia must be positive, got {i:?}"),
         }
@@ -368,8 +379,14 @@ impl AirframeSpec {
         if self.inertia.iter().any(|i| !(*i > 0.0) || !i.is_finite()) {
             return Err(BuildError::BadInertia(self.inertia));
         }
-        if self.rotors.is_empty() {
-            return Err(BuildError::NoRotors);
+        // An UNPOWERED airframe is legitimate and is the most useful thing to
+        // validate against: a glider's steady glide ratio is exactly its L/D,
+        // its phugoid period has a closed form, and a flat plate has a textbook
+        // drag coefficient. None of those need a motor, a controller or a log,
+        // and all of them are predictions from theory this model did not supply.
+        // Requiring a rotor made the best available test articles undescribable.
+        if self.rotors.is_empty() && self.wings.is_empty() {
+            return Err(BuildError::NothingToFly);
         }
 
         // Airfoils first: everything else indexes into this.

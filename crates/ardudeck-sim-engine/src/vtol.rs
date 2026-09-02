@@ -151,6 +151,26 @@ impl VtolVehicle {
         self.ground_height = h;
     }
 
+    /// Rotor speeds (rad/s), in spec order.
+    ///
+    /// Public because rotor speed is a genuine STATE that `VehicleState` does
+    /// not carry, and a replay or a scenario restart that ignores it starts the
+    /// model on a different spool-up path than the flight it is being compared
+    /// against. That difference is small, physical, and entirely capable of
+    /// swamping the model error it is meant to measure.
+    pub fn rotor_speeds(&self) -> Vec<f64> {
+        self.rotors.iter().map(|r| r.omega).collect()
+    }
+
+    /// Set the rotor speeds, from ESC telemetry or from a saved state.
+    pub fn set_rotor_speeds(&mut self, omega: &[f64]) {
+        for (i, r) in self.rotors.iter_mut().enumerate() {
+            if let Some(w) = omega.get(i) {
+                r.omega = w.max(0.0);
+            }
+        }
+    }
+
     /// Spin the rotors up to where the given throttle would hold them unloaded,
     /// so a scenario can start in flight instead of spending its first second
     /// spooling up from rest.
@@ -488,15 +508,22 @@ impl SimVehicle for VtolVehicle {
     }
 
     fn rigid_state(&self) -> Option<(Vec3, Vec3, f64)> {
-        // Bounding radius from the outermost rotor hub plus its own radius: the
-        // rotors are what a neighbour actually collides with.
-        let reach = self
+        // Bounding radius from the outermost rotor hub plus its own radius, or
+        // from the wing tips on an unpowered airframe, which has no rotors to
+        // measure and would otherwise report a constant.
+        let rotor_reach = self
             .airframe
             .rotors
             .iter()
             .map(|r| r.position.length() + r.radius)
             .fold(0.0f64, f64::max);
-        Some((self.state.position, self.state.velocity, reach.max(0.2)))
+        let wing_reach = self
+            .airframe
+            .surfaces
+            .iter()
+            .map(|s| s.position.length())
+            .fold(0.0f64, f64::max);
+        Some((self.state.position, self.state.velocity, rotor_reach.max(wing_reach).max(0.2)))
     }
 }
 
@@ -508,64 +535,7 @@ mod tests {
     /// A 5 kg lift+cruise quadplane: four lift rotors, one pusher, a wing with
     /// elevons and a fin. Written the way a partner would write it, from
     /// geometry, with no coefficient anywhere.
-    const QUADPLANE: &str = r#"{
-      "name": "test-quadplane",
-      "mass": 5.0,
-      "inertia": [0.28, 0.32, 0.52],
-      "voltage_max": 22.2,
-      "pwm": { "min": 1000.0, "max": 2000.0 },
-      "airfoils": {
-        "wing":  { "cl_alpha": 6.28, "alpha_0_deg": -2.5, "alpha_stall_deg": 13.0,
-                   "alpha_stall_neg_deg": -11.0, "cd_min": 0.014, "cd_k": 0.02, "cm_0": -0.06 },
-        "tail":  { "cl_alpha": 6.0, "alpha_stall_deg": 12.0, "alpha_stall_neg_deg": -12.0,
-                   "cd_min": 0.012 },
-        "blade": { "cl_alpha": 5.7, "alpha_0_deg": -3.0, "alpha_stall_deg": 12.5,
-                   "alpha_stall_neg_deg": -11.0, "cd_min": 0.015, "cd_k": 0.04 }
-      },
-      "wings": [
-        { "name": "wing", "root": [0.0, 0.06, -0.02], "semi_span": 0.85,
-          "chord_root": 0.26, "chord_tip": 0.20, "incidence_deg": 2.0, "twist_deg": -2.0,
-          "airfoil": "wing", "strips": 8,
-          "controls": [ { "name": "elevon", "channel": 4, "gain": 1.0, "mirror_gain": -1.0,
-                          "span_start": 0.45, "span_end": 1.0, "chord_fraction": 0.25,
-                          "max_deflect_deg": 25.0 } ] },
-        { "name": "tailplane", "root": [-0.75, 0.04, -0.05], "semi_span": 0.30,
-          "chord_root": 0.16, "chord_tip": 0.13, "airfoil": "tail", "strips": 4,
-          "controls": [ { "name": "elevator", "channel": 5, "gain": 1.0, "mirror_gain": 1.0,
-                          "chord_fraction": 0.4, "max_deflect_deg": 25.0 } ] },
-        { "name": "fin", "root": [-0.78, 0.0, -0.06], "semi_span": 0.22,
-          "chord_root": 0.16, "chord_tip": 0.11, "airfoil": "tail", "strips": 3,
-          "vertical": true, "mirror": false }
-      ],
-      "rotors": [
-        { "name": "lift_fr", "position": [ 0.32,  0.36, -0.04], "axis": [0,0,-1],
-          "radius": 0.19, "blades": 2, "chord_root": 0.030, "chord_tip": 0.018,
-          "pitch_root_deg": 24.0, "pitch_tip_deg": 9.0, "airfoil": "blade", "spin": 1.0,
-          "inertia": 6.0e-5, "kv": 400.0, "resistance": 0.08, "no_load_current": 0.7,
-          "throttle_channel": 0 },
-        { "name": "lift_rl", "position": [-0.32, -0.36, -0.04], "axis": [0,0,-1],
-          "radius": 0.19, "blades": 2, "chord_root": 0.030, "chord_tip": 0.018,
-          "pitch_root_deg": 24.0, "pitch_tip_deg": 9.0, "airfoil": "blade", "spin": 1.0,
-          "inertia": 6.0e-5, "kv": 400.0, "resistance": 0.08, "no_load_current": 0.7,
-          "throttle_channel": 1 },
-        { "name": "lift_fl", "position": [ 0.32, -0.36, -0.04], "axis": [0,0,-1],
-          "radius": 0.19, "blades": 2, "chord_root": 0.030, "chord_tip": 0.018,
-          "pitch_root_deg": 24.0, "pitch_tip_deg": 9.0, "airfoil": "blade", "spin": -1.0,
-          "inertia": 6.0e-5, "kv": 400.0, "resistance": 0.08, "no_load_current": 0.7,
-          "throttle_channel": 2 },
-        { "name": "lift_rr", "position": [-0.32,  0.36, -0.04], "axis": [0,0,-1],
-          "radius": 0.19, "blades": 2, "chord_root": 0.030, "chord_tip": 0.018,
-          "pitch_root_deg": 24.0, "pitch_tip_deg": 9.0, "airfoil": "blade", "spin": -1.0,
-          "inertia": 6.0e-5, "kv": 400.0, "resistance": 0.08, "no_load_current": 0.7,
-          "throttle_channel": 3 },
-        { "name": "pusher", "position": [-0.85, 0.0, -0.04], "axis": [1,0,0],
-          "radius": 0.14, "blades": 2, "chord_root": 0.024, "chord_tip": 0.014,
-          "pitch_root_deg": 32.0, "pitch_tip_deg": 14.0, "airfoil": "blade", "spin": 1.0,
-          "inertia": 3.0e-5, "kv": 900.0, "resistance": 0.05, "no_load_current": 0.9,
-          "throttle_channel": 6 }
-      ],
-      "fuselage": { "area_cd": [0.018, 0.075, 0.085] }
-    }"#;
+    const QUADPLANE: &str = include_str!("test_quadplane.json");
 
     fn quadplane() -> VtolVehicle {
         let spec = AirframeSpec::from_json(QUADPLANE).expect("spec parses");
@@ -689,27 +659,35 @@ mod tests {
     /// A hovering quadplane at equal throttle must be in MOMENT BALANCE. Not
     /// that it holds attitude for three seconds: no multirotor does that open
     /// loop, and asserting it would only be asserting that ArduPilot is absent.
-    /// What has to hold is that the airframe itself introduces no bias, because
-    /// a bias here is indistinguishable from bad tuning once the loop is closed
-    /// and it cannot be tuned out.
+    /// What has to hold is that the AIRFRAME introduces no bias, because a bias
+    /// here is indistinguishable from bad tuning once the loop is closed, and it
+    /// cannot be tuned out.
+    ///
+    /// Evaluated on a single sub-step from rest. Forces are computed at the
+    /// state on entry, so one sub-step reads the pristine layout; running longer
+    /// mixes in real dynamics (the pusher's torque starts a roll, which reaches
+    /// the lift rotors as a genuine flow difference) and turns a clean symmetry
+    /// check into a hunt for the right epsilon.
     #[test]
     fn a_hovering_quadplane_is_in_moment_balance() {
         let mut v = quadplane();
         v.seed_rotors(0.55);
         v.set_state(VehicleState { position: Vec3::new(0.0, 0.0, -50.0), ..initial_state() });
-        v.step(&pwm(0.55, 0.0), 0.0025);
+        v.step(&pwm(0.55, 0.0), 1e-4);
         let d = v.diagnostics_full();
         // Lift rotors only. The pusher is a SINGLE prop, so its reaction torque
-        // genuinely rolls the aircraft and there is nothing to cancel it; that
-        // is real and is asserted separately.
+        // genuinely rolls the aircraft with nothing to cancel it; that is real
+        // and is asserted separately.
         let m: Vec3 = d.rotors[..4].iter().fold(Vec3::zero(), |a, r| a.add(r.moment_bf));
-        // Symmetric layout: no roll or pitch bias.
-        assert!(m.x.abs() < 1e-6, "roll bias {}", m.x);
-        assert!(m.y.abs() < 1e-6, "pitch bias {}", m.y);
-        // Counter-rotating pairs: the reaction torques cancel.
-        assert!(m.z.abs() < 1e-6, "yaw bias {}", m.z);
-        // And the wing is centred, so it contributes no rolling moment either.
-        assert!(d.aero.moment_bf.x.abs() < 1e-6, "wing roll bias {}", d.aero.moment_bf.x);
+        assert!(d.rotors[..4].iter().all(|r| r.thrust > 1.0), "rotors not lifting");
+        // Symmetric layout: no bias in any axis. The wing-mirroring bug this
+        // caught showed up here at 2.6% of roll authority.
+        assert!(m.x.abs() < 1e-9, "roll bias {}", m.x);
+        assert!(m.y.abs() < 1e-9, "pitch bias {}", m.y);
+        // Counter-rotating pairs: the reaction torques cancel outright.
+        assert!(m.z.abs() < 1e-9, "yaw bias {}", m.z);
+        // The wing is centred, so it contributes no rolling moment either.
+        assert!(d.aero.moment_bf.x.abs() < 1e-9, "wing roll bias {}", d.aero.moment_bf.x);
     }
 
     /// A lone pusher prop rolls the aircraft against its own torque, with
