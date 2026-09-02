@@ -217,7 +217,7 @@ export async function listParametersTool(params: {
   const pref = params.prefix?.toUpperCase();
   const needle = params.search?.toLowerCase();
   const filtered = all.filter((entry: any) => {
-    const name = String(entry?.name ?? entry?.paramId ?? '').toUpperCase();
+    const name = String(entry?.id ?? entry?.name ?? entry?.paramId ?? '').toUpperCase();
     if (pref && !name.startsWith(pref)) return false;
     if (needle && !name.toLowerCase().includes(needle)) return false;
     return true;

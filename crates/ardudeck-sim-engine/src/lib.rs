@@ -8,7 +8,9 @@
 
 #![allow(dead_code)]
 
+pub mod aero;
 pub mod battery;
+pub mod bemt;
 pub mod collision;
 pub mod copter;
 pub mod fault;

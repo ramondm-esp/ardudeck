@@ -38,7 +38,7 @@ export function getStoreState(storeName: string, path?: string): any {
   let current: any = state;
   for (const part of parts) {
     if (current == null) return undefined;
-    current = current[part];
+    current = current instanceof Map ? current.get(part) : current[part];
   }
   return serialize(current);
 }
@@ -84,7 +84,7 @@ function getNestedValue(obj: any, path: string): any {
   let current = obj;
   for (const part of parts) {
     if (current == null) return undefined;
-    current = current[part];
+    current = current instanceof Map ? current.get(part) : current[part];
   }
   return current;
 }
