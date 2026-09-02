@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 pub mod aero;
+pub mod airframe;
 pub mod battery;
 pub mod bemt;
 pub mod collision;
@@ -29,6 +30,7 @@ pub mod scenario;
 pub mod sensors;
 pub mod state_stream;
 pub mod terrain;
+pub mod vtol;
 pub mod wake;
 pub mod wind;
 pub mod world;

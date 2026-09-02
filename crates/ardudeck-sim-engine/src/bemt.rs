@@ -60,8 +60,11 @@ pub struct Rotor {
     /// Unit thrust axis in body frame at zero tilt. Body -z (up) for a lift
     /// rotor, body +x (forward) for a pusher.
     pub axis: Vec3,
-    /// Axis the rotor tilts about, body frame. Body +y (the pitch axis) tilts a
-    /// lift rotor forward into a pusher, which is the tiltrotor case.
+    /// Axis the rotor tilts about, body frame, right-hand rule. A lift rotor
+    /// (axis body -z) tilting FORWARD into a pusher uses body -y: a positive
+    /// rotation about +y takes -z to -x, which points the rotor backwards. The
+    /// rotation is plain Rodrigues with no special cases, so this is a property
+    /// of the airframe description rather than something the code adjusts for.
     pub tilt_axis: Vec3,
     pub radius: f64,
     pub blades: usize,
@@ -137,7 +140,11 @@ pub struct RotorOutput {
     pub thrust: f64,
     /// In-plane force magnitude, opposing the edgewise flow (N).
     pub h_force: f64,
-    /// Aerodynamic torque resisting rotation (N m), always >= 0.
+    /// Aerodynamic shaft torque (N m). Positive resists rotation, the normal
+    /// case. NEGATIVE means the airflow is driving the rotor: a windmilling
+    /// prop or an autorotating lift rotor. That is a real state a VTOL reaches
+    /// in a fast descent or with a dead motor, so it is not clamped away, and
+    /// the yaw reaction correctly reverses with it.
     pub torque: f64,
     /// Converged mean induced velocity through the disc (m/s).
     pub induced_velocity: f64,
@@ -145,7 +152,9 @@ pub struct RotorOutput {
     pub advance_ratio: f64,
     /// Wake skew angle from the disc axis (rad). 0 = axial, pi/2 = fully edgewise.
     pub skew: f64,
-    /// Pack current this rotor draws (A).
+    /// Pack current this rotor draws (A). Negative under a driving airflow:
+    /// a windmilling rotor regenerates into the pack, which is real and which
+    /// the battery model should see rather than have hidden from it.
     pub current: f64,
     /// True while the operating point sits inside the vortex ring state, where
     /// momentum theory has no solution and the empirical fit is in use.
@@ -186,22 +195,48 @@ pub fn axial_inflow_ratio(vc_over_vh: f64) -> (f64, FlowState) {
     if x >= 0.0 {
         let h = x / 2.0;
         (-h + (h * h + 1.0).sqrt(), FlowState::Normal)
+    } else if x <= VRS_BLEND_END {
+        (windmill_ratio(x), FlowState::WindmillBrake)
     } else if x <= -2.0 {
-        let h = x / 2.0;
-        (-h - (h * h - 1.0).sqrt(), FlowState::WindmillBrake)
+        // Momentum theory's windmill solution has a VERTICAL TANGENT at exactly
+        // -2: the sqrt(h^2 - 1) term. Left alone that is a force step in the FDM
+        // during a descent, which is precisely when a customer is watching. Blend
+        // from the fit's value at -2 out to where the windmill branch's slope is
+        // finite again. Smoothstep and not a lerp: its zero derivative at the
+        // join is what cancels the sqrt's infinite one.
+        let t = ((x + 2.0) / (VRS_BLEND_END + 2.0)).clamp(0.0, 1.0);
+        let w = t * t * (3.0 - 2.0 * t);
+        let fit = vrs_fit(-2.0);
+        (fit * (1.0 - w) + windmill_ratio(x) * w, FlowState::WindmillBrake)
     } else {
-        // Empirical fit over -2 <= Vc/vh <= 0. Matches 1.0 at hover by
-        // construction and is within 3% of the windmill branch at -2, so the
-        // curve is continuous across both joins.
-        let k = [1.0, -1.125, -1.372, -1.718, -0.655];
-        let mut v = 0.0;
-        let mut p = 1.0;
-        for c in k {
-            v += c * p;
-            p *= x;
-        }
-        (v, FlowState::VortexRing)
+        (vrs_fit(x), FlowState::VortexRing)
     }
+}
+
+/// Where the empirical fit hands back to momentum theory's windmill branch.
+/// Not at -2, where that branch's slope is infinite: far enough out that it is
+/// smooth again.
+const VRS_BLEND_END: f64 = -3.0;
+
+/// Momentum theory in the windmill brake state.
+fn windmill_ratio(x: f64) -> f64 {
+    let h = x / 2.0;
+    -h - (h * h - 1.0).max(0.0).sqrt()
+}
+
+/// Empirical fit over -2 <= Vc/vh <= 0, where the flow recirculates and momentum
+/// theory's control volume assumption is violated outright. Coefficients from
+/// the collected descent and autorotation measurements (Leishman 2.14.3). Equals
+/// 1.0 at hover by construction, which is what joins it to the normal branch.
+fn vrs_fit(x: f64) -> f64 {
+    let k = [1.0, -1.125, -1.372, -1.718, -0.655];
+    let mut v = 0.0;
+    let mut p = 1.0;
+    for c in k {
+        v += c * p;
+        p *= x;
+    }
+    v
 }
 
 /// Solve Glauert's inflow equation for a rotor at incidence:
@@ -252,9 +287,26 @@ pub fn drees_inflow_gradient(chi: f64, mu: f64) -> (f64, f64) {
     if s.abs() < 1e-6 {
         return (0.0, 0.0);
     }
-    let k_x = (4.0 / 3.0) * ((1.0 - chi.cos() - 1.8 * mu * mu) / s);
-    (k_x, -2.0 * mu)
+    // Drees is a fit to HELICOPTER forward flight and is only meaningful up to
+    // mu of roughly 0.3 to 0.4. Past that the 1.8*mu^2 term is extrapolation,
+    // and it grows without bound.
+    //
+    // That is not a hypothetical: a lift rotor spooling down at the end of a
+    // transition passes through a nearly stopped disc in 30 m/s of edgewise
+    // flow, where mu reaches the hundreds. The gradient then swamps the inflow,
+    // the blade element pass overflows, and the FDM emits NaN several seconds
+    // later with nothing else out of the ordinary anywhere in the state. Bound
+    // the model to its own validity instead.
+    let mu_c = mu.clamp(-MU_MAX, MU_MAX);
+    let k_x = ((4.0 / 3.0) * ((1.0 - chi.cos() - 1.8 * mu_c * mu_c) / s)).clamp(-K_MAX, K_MAX);
+    (k_x, (-2.0 * mu_c).clamp(-K_MAX, K_MAX))
 }
+
+/// Advance ratio beyond which Drees' fit is extrapolation rather than model.
+const MU_MAX: f64 = 0.5;
+/// Bound on the inflow gradient. Drees peaks near 1.2 at high skew, so this
+/// leaves the model untouched everywhere it is valid and only catches the tail.
+const K_MAX: f64 = 2.0;
 
 /// Prandtl tip-loss factor at radial station `x` for a rotor with `b` blades at
 /// inflow angle `phi`. Lift falls to zero at the tip because the pressure
@@ -429,7 +481,14 @@ impl Rotor {
                 // Tangential: rotation plus the edgewise component, which adds on
                 // the advancing side and subtracts on the retreating side. This
                 // asymmetry is the entire source of the H-force and hub moment.
-                let u_t = omega * rad + self.spin * v_par * sp;
+                //
+                // The sign is derived, not chosen: the blade sits along
+                // d = par*cos(psi) + lat*sin(psi) and moves along
+                // t = spin*(-par*sin(psi) + lat*cos(psi)), so the edgewise flow
+                // contributes v_par*(par . t) = -spin*v_par*sin(psi). Flipping it
+                // shifts the whole disc by 180 deg of azimuth, which inverts the
+                // H-force into thrust and the hub moment with it.
+                let u_t = omega * rad - self.spin * v_par * sp;
                 // Perpendicular: through-disc flow, with Drees' linear gradient.
                 let lambda = vi * (1.0 + kx * x * cp + ky * x * sp);
                 // Leishman's inflow ratio: the through-disc flow is the climb
@@ -546,7 +605,8 @@ mod tests {
         Rotor {
             position: Vec3::new(0.35, 0.35, 0.0),
             axis: Vec3::new(0.0, 0.0, -1.0),
-            tilt_axis: Vec3::new(0.0, 1.0, 0.0),
+            // Forward tilt: see `Rotor::tilt_axis`. +y would tilt it backwards.
+            tilt_axis: Vec3::new(0.0, -1.0, 0.0),
             radius: 0.19,
             blades: 2,
             chord_root: 0.030,
@@ -786,6 +846,50 @@ mod tests {
         assert!(hub_moving > 1e-4, "edgewise hub moment {hub_moving}");
     }
 
+    /// The exact operating point that produced a NaN: a lift rotor spooling
+    /// down through fast edgewise flow at the end of a transition. Advance ratio
+    /// runs away, and if the inflow gradient runs away with it the whole FDM
+    /// goes non-finite a few seconds later with nothing visibly wrong before it.
+    #[test]
+    fn a_nearly_stopped_rotor_in_fast_flow_stays_finite() {
+        let r = lift_rotor();
+        let af = blade_airfoil();
+        for omega in [1e-5, 1e-3, 0.1, 1.0, 5.0, 30.0] {
+            for speed in [10.0, 30.0, 60.0] {
+                let o = r.forces(
+                    RotorState { omega, tilt: 0.0 },
+                    Vec3::new(speed, 0.0, 2.0),
+                    Vec3::zero(),
+                    1.225,
+                    &af,
+                    Vec3::zero(),
+                );
+                for c in [o.force_bf.x, o.force_bf.y, o.force_bf.z, o.moment_bf.x,
+                          o.moment_bf.y, o.moment_bf.z, o.thrust, o.torque, o.induced_velocity] {
+                    assert!(c.is_finite(), "non-finite at omega {omega} speed {speed}");
+                }
+                // And bounded: a stopped 15 inch disc cannot make kilonewtons.
+                assert!(o.force_bf.length() < 500.0,
+                    "implausible force {} at omega {omega} speed {speed}", o.force_bf.length());
+            }
+        }
+    }
+
+    #[test]
+    fn the_inflow_gradient_is_bounded_at_any_advance_ratio() {
+        for mu in [0.0, 0.2, 0.5, 5.0, 500.0, 1e6] {
+            for chi in [0.1, 0.7, 1.4, PI / 2.0] {
+                let (kx, ky) = drees_inflow_gradient(chi, mu);
+                assert!(kx.is_finite() && ky.is_finite(), "non-finite at mu {mu} chi {chi}");
+                assert!(kx.abs() <= 2.0 + 1e-9 && ky.abs() <= 2.0 + 1e-9,
+                    "unbounded gradient {kx},{ky} at mu {mu} chi {chi}");
+            }
+        }
+        // Untouched where the model is valid.
+        let (kx, _) = drees_inflow_gradient(1.2, 0.25);
+        assert!((kx - (4.0 / 3.0) * ((1.0 - 1.2f64.cos() - 1.8 * 0.0625) / 1.2f64.sin())).abs() < 1e-12);
+    }
+
     #[test]
     fn drees_gradient_vanishes_in_axial_flow_and_grows_with_skew() {
         let (kx0, ky0) = drees_inflow_gradient(0.0, 0.0);
@@ -950,7 +1054,9 @@ mod tests {
                               o.thrust, o.torque, o.induced_velocity, o.current] {
                         assert!(c.is_finite(), "non-finite at v {v:?} tilt {tilt} omega {omega}");
                     }
-                    assert!(o.torque >= 0.0, "negative torque at v {v:?}");
+                    // Torque is NOT asserted positive: a windmilling rotor is
+                    // driven by the air and its shaft torque is genuinely
+                    // negative. `a_windmilling_rotor_autorotates` covers that.
                 }
             }
         }
@@ -970,6 +1076,56 @@ mod tests {
         // And moving forward at the same descent rate gets out of it.
         let escaped = run(&r, 800.0, Vec3::new(25.0, 0.0, hover_vi));
         assert!(!escaped.in_vrs, "forward flight should clear VRS");
+    }
+
+    /// A rotor driven by the airflow puts torque INTO the shaft, and the sign
+    /// must survive into the yaw reaction and the pack current. This is the
+    /// quadplane's dead pusher in cruise, and a lift rotor left unpowered after
+    /// transition, so it is a state a customer's airframe reaches every flight.
+    ///
+    /// It needs fast AXIAL flow, not vertical descent. In descent the inflow
+    /// angle is negative, so alpha = theta - phi only ever grows and a
+    /// positive-pitch blade is stalled throughout: drag then resists in every
+    /// direction and the rotor cannot be driven. Flying fast along the thrust
+    /// axis drives phi past theta instead, which puts the blade at NEGATIVE
+    /// alpha, and that is what tilts the resultant force forward of the rotation
+    /// axis. Props windmill on a diving aircraft, not on a descending helicopter.
+    #[test]
+    fn a_windmilling_rotor_autorotates_in_fast_axial_flow() {
+        let mut r = lift_rotor();
+        r.axis = Vec3::new(1.0, 0.0, 0.0);
+        r.position = Vec3::new(-0.5, 0.0, 0.0);
+        // 45 m/s through a barely turning prop: the classic windmilling case.
+        let out = run(&r, 120.0, Vec3::new(45.0, 0.0, 0.0));
+        assert!(out.torque < 0.0, "expected driving torque, got {}", out.torque);
+        assert!(out.current < 0.0, "windmilling should regenerate, got {}", out.current);
+        // A windmilling prop DRAGS: negative thrust along its own axis.
+        assert!(out.thrust < 0.0, "windmilling prop should drag, got {}", out.thrust);
+        // Powered hover must still resist, or the sign is simply inverted.
+        assert!(run(&lift_rotor(), 800.0, Vec3::zero()).torque > 0.0);
+    }
+
+    /// The other half of the same fact: somewhere between driving the air and
+    /// being driven by it the shaft torque passes through zero, and that point
+    /// is the prop's own equilibrium speed at that airspeed. It has to exist, or
+    /// a freewheeling rotor has no speed to settle at.
+    #[test]
+    fn a_freewheeling_prop_has_an_equilibrium_speed() {
+        let mut r = lift_rotor();
+        r.axis = Vec3::new(1.0, 0.0, 0.0);
+        r.position = Vec3::zero();
+        let airspeed = Vec3::new(45.0, 0.0, 0.0);
+        let torque_at = |om: f64| run(&r, om, airspeed).torque;
+        assert!(torque_at(120.0) < 0.0, "slow prop should be driven");
+        assert!(torque_at(2500.0) > 0.0, "fast prop should resist");
+        // Bisect for the crossing.
+        let (mut lo, mut hi) = (120.0, 2500.0);
+        for _ in 0..40 {
+            let mid = 0.5 * (lo + hi);
+            if torque_at(mid) < 0.0 { lo = mid } else { hi = mid }
+        }
+        assert!(torque_at(0.5 * (lo + hi)).abs() < 1e-3, "no clean crossing");
+        assert!((200.0..2400.0).contains(&lo), "equilibrium at {lo} rad/s");
     }
 
     #[test]

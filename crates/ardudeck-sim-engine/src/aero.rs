@@ -472,6 +472,15 @@ pub struct FlowField<'a> {
     /// neighbour wake, gust structure. Returns the velocity of the AIR relative
     /// to the airframe, so a downward prop wash on a wing below the disc is +z.
     pub induced: &'a dyn Fn(Vec3) -> Vec3,
+    /// Per-strip induced flow, indexed like `surfaces`, taking precedence over
+    /// the closure where supplied.
+    ///
+    /// A closure keyed on POSITION cannot express a strip washed by two rotors
+    /// at different immersions, because the caller has already had to collapse
+    /// them to one vector before it can answer. Handing the resolved per-strip
+    /// vector in directly is both correct and cheaper: the wake geometry is
+    /// solved once per strip instead of once per lookup.
+    pub induced_per_surface: Option<&'a [Vec3]>,
 }
 
 /// Zero induced flow, for tests and for a strip set with no rotors near it.
@@ -496,13 +505,17 @@ pub fn surface_forces(
     let mut area_total = 0.0;
     let mut area_stalled = 0.0;
 
-    for s in surfaces {
+    for (si, s) in surfaces.iter().enumerate() {
         // Local flow: vehicle motion, the strip's own velocity from body rates,
         // and whatever the caller induces there. The rotation term is why a strip
         // model damps in roll and pitch without a separate damping derivative.
         let v_rot = flow.gyro.cross(s.position);
         let v_ind = if s.wash_fraction > 0.0 {
-            (flow.induced)(s.position).scale(s.wash_fraction)
+            let raw = match flow.induced_per_surface {
+                Some(per) => per.get(si).copied().unwrap_or_else(|| (flow.induced)(s.position)),
+                None => (flow.induced)(s.position),
+            };
+            raw.scale(s.wash_fraction)
         } else {
             Vec3::zero()
         };
@@ -626,6 +639,7 @@ mod tests {
             gyro: Vec3::zero(),
             air_density: 1.225,
             induced: &no_induced,
+            induced_per_surface: None,
         }
     }
 
@@ -781,6 +795,7 @@ mod tests {
             gyro: Vec3::new(1.0, 0.0, 0.0),
             air_density: 1.225,
             induced: &no_induced,
+            induced_per_surface: None,
         };
         let out = surface_forces(&wings, &t, &[], &f);
         assert!(out.moment_bf.x < 0.0, "roll rate +x needs a -x moment, got {}", out.moment_bf.x);
@@ -795,6 +810,7 @@ mod tests {
             gyro: Vec3::new(0.0, 1.0, 0.0),
             air_density: 1.225,
             induced: &no_induced,
+            induced_per_surface: None,
         };
         let out = surface_forces(&tail, &t, &[], &f);
         assert!(out.moment_bf.y < 0.0, "pitch rate +y needs a -y moment, got {}", out.moment_bf.y);
@@ -916,6 +932,7 @@ mod tests {
             gyro: Vec3::zero(),
             air_density: 1.225,
             induced: &wash,
+            induced_per_surface: None,
         };
         let with_wash = surface_forces(&s, &t, &[], &f);
         let without = surface_forces(&s, &t, &[], &flow(Vec3::new(2.0, 0.0, 0.5)));
@@ -937,6 +954,7 @@ mod tests {
             gyro: Vec3::zero(),
             air_density: 1.225,
             induced: &wash,
+            induced_per_surface: None,
         };
         let q_full = surface_forces(&mk(1.0), &t, &[], &f).diag[0].q;
         let q_half = surface_forces(&mk(0.5), &t, &[], &f).diag[0].q;
