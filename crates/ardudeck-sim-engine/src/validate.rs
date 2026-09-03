@@ -339,9 +339,18 @@ pub fn replay_with(
         // this scores the model on a wind the aircraft never flew in, which
         // shows up as a bias in cruise and looks like a lift error.
         if let Some(w) = fr.wind {
-            let mut env = crate::copter::DEFAULT_ENVIRONMENT;
-            env.wind = w;
-            vehicle.set_environment(env);
+            // The WIND FIELD, not the environment. The vehicle samples its
+            // atmosphere every frame and derives the environment from it, so an
+            // environment set here is overwritten before it is ever used. The
+            // logged wind is a measured MEAN at that instant, so it goes in as a
+            // uniform field with no gust of its own: the log already contains
+            // whatever turbulence the aircraft actually flew through, in its
+            // response, and adding more would be counting it twice.
+            vehicle.set_wind_field(crate::wind::WindField::from_uniform(crate::wind::WindConfig {
+                steady: w,
+                intensity: 0.0,
+                time_constant: 1.0,
+            }));
         }
 
         let reinit = match mode {

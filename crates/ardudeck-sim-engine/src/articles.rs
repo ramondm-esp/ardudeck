@@ -15,9 +15,7 @@
 /// planing.
 pub const FOAM_SHEET: &str = r#"{
   "name": "foam-sheet", "mass": 0.020, "inertia": [3.0e-4, 3.0e-4, 6.0e-4],
-  "airfoils": { "plate": { "cl_alpha": 6.28318, "alpha_0_deg": 0.0,
-                           "alpha_stall_deg": 22.0, "alpha_stall_neg_deg": -22.0,
-                           "cd_min": 0.02, "cd_k": 0.0, "cm_0": 0.0 } },
+  "airfoils": { "plate": { "naca": "0004", "reynolds": 2.0e5 } },
   "wings": [ { "name": "sheet", "root": [0.075, 0.0, 0.0], "semi_span": 0.15,
                "chord_root": 0.30, "chord_tip": 0.30, "airfoil": "plate", "strips": 6 } ],
   "rotors": [],
@@ -37,6 +35,30 @@ pub const FOAM_STRIP: &str = r#"{
   "rotors": []
 }"#;
 
+/// The SAME 300 x 300 sheet, with a rounded leading edge.
+///
+/// Identical planform, area, mass and inertia. The only difference is the
+/// section, and that is the point of having it: strip theory has no geometry
+/// finer than chord and area, so it CANNOT see a leading edge. Everything a
+/// rounded nose does aerodynamically has to arrive as coefficients.
+///
+/// What actually changes, and why:
+///
+/// The pair is a NACA 0004 against a NACA 0018: the same planform wearing a
+/// nearly sharp nose and a distinctly blunt one. Nothing about their behaviour
+/// is stated anywhere. Both polars are SOLVED from the coordinates by `panel`
+/// and `bl`, so the stall angle, the drag and the lift curve all follow from
+/// the shape, and the thin one lets go first because its leading edge makes a
+/// suction peak the boundary layer cannot survive.
+pub const FOAM_SHEET_LE: &str = r#"{
+  "name": "sheet, rounded LE", "mass": 0.020, "inertia": [3.0e-4, 3.0e-4, 6.0e-4],
+  "airfoils": { "rounded": { "naca": "0018", "reynolds": 2.0e5 } },
+  "wings": [ { "name": "sheet", "root": [0.075, 0.0, 0.0], "semi_span": 0.15,
+               "chord_root": 0.30, "chord_tip": 0.30, "airfoil": "rounded", "strips": 6 } ],
+  "rotors": [],
+  "fuselage": { "area_cd": [0.0, 0.0, 0.0] }
+}"#;
+
 /// A dart. Tailless, swept, trimmed by washout, and lightly enough damped that
 /// it swoops the whole way down like the real thing.
 pub const PAPER_PLANE: &str = r#"{
@@ -47,7 +69,10 @@ pub const PAPER_PLANE: &str = r#"{
   "wings": [ { "name": "wing", "root": [0.024, 0.006, 0.0], "semi_span": 0.10,
                "chord_root": 0.20, "chord_tip": 0.06, "sweep_deg": 42.0,
                "incidence_deg": 3.0, "twist_deg": -18.0,
-               "airfoil": "paper", "strips": 8, "oswald": 0.80 } ],
+               "airfoil": "paper", "strips": 8, "oswald": 0.80 },
+    { "name": "keel", "root": [-0.01, 0.0, 0.0], "semi_span": -0.035,
+      "chord_root": 0.16, "chord_tip": 0.07, "sweep_deg": 30.0,
+      "airfoil": "paper", "strips": 4, "vertical": true, "mirror": false } ],
   "rotors": [],
   "fuselage": { "area_cd": [0.0006, 0.0025, 0.0012] }
 }"#;
@@ -78,7 +103,8 @@ pub const GLIDER: &str = r#"{
 
 /// Every article, in the order a demo should show them: simplest first.
 pub const ALL: &[(&str, &str)] = &[
-    ("foam sheet", FOAM_SHEET),
+    ("sheet, sharp LE", FOAM_SHEET),
+    ("sheet, rounded LE", FOAM_SHEET_LE),
     ("paper plane", PAPER_PLANE),
     ("glider", GLIDER),
 ];

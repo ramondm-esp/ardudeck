@@ -155,6 +155,7 @@ import type { EdgeTxScanResult, InstalledPackageRecord } from '../shared/edgetx-
 import { registerMspHandlers, tryMspDetection, startMspTelemetry, stopMspTelemetry, cleanupMspConnection, exitCliModeIfActive, autoConfigureSitlPlatform, getMspVehicleType, resetSitlAutoConfig } from './msp/index.js';
 import { initCalibrationHandlers, cleanupCalibrationHandlers, handleCalibrationStatusText, handleCalibrationCommandAck, handleIncomingCommandLong, handleMagCalProgress, handleMagCalReport, isMavlinkCalibrationActive, cancelCalibration, type MavlinkCalibrationDeps } from './calibration/index.js';
 import { initMissionLibraryHandlers, cleanupMissionLibraryHandlers } from './mission-library/index.js';
+import { nextTxSeq } from './tx-sequence.js';
 import { MavlinkFtpClient, parseParamPack, PARAM_PCK_PATH, parseFtpPayload } from './mavlink-ftp/index.js';
 import { ingestNamedValueFloat, getScriptHealth, resetHeartbeat, subscribeHealth } from './script-installer/heartbeat-tracker.js';
 import * as scriptRegistry from './script-installer/registry-store.js';
@@ -730,9 +731,10 @@ async function sendMavlinkPacket(
   msgid: number,
   payload: Uint8Array,
   crcExtra: number,
-  options: { sysid?: number; compid?: number; sequence?: number } = {}
+  options: { sysid?: number; compid?: number; sequence?: number; link?: object | null } = {}
 ): Promise<Uint8Array> {
-  const opts = { sysid: gcsSysid, compid: 190, ...options };
+  const { link, ...rest } = options;
+  const opts = { sysid: gcsSysid, compid: 190, sequence: nextTxSeq(link ?? currentTransport), ...rest };
 
   if (signingEnabled && signingKey && detectedMavlinkVersion === 2) {
     if (!signingLoggedOnce) {
@@ -1087,7 +1089,7 @@ async function requestStreamsOnTransport(
         param2: intervalUs,
         param3: 0, param4: 0, param5: 0, param6: 0, param7: 0,
       });
-      const pkt = await sendMavlinkPacket(COMMAND_LONG_ID, cmdPayload, COMMAND_LONG_CRC_EXTRA);
+      const pkt = await sendMavlinkPacket(COMMAND_LONG_ID, cmdPayload, COMMAND_LONG_CRC_EXTRA, { link: transport });
       await transport.write(pkt);
       await new Promise(resolve => setTimeout(resolve, 15));
     } catch {
@@ -1128,7 +1130,7 @@ async function requestStreamsOnTransport(
         reqMessageRate: req.hz,
         startStop: 1,
       });
-      const pkt = await sendMavlinkPacket(REQUEST_DATA_STREAM_ID, payload, REQUEST_DATA_STREAM_CRC_EXTRA);
+      const pkt = await sendMavlinkPacket(REQUEST_DATA_STREAM_ID, payload, REQUEST_DATA_STREAM_CRC_EXTRA, { link: transport });
       await transport.write(pkt);
       await new Promise(resolve => setTimeout(resolve, 15));
     } catch {
@@ -1448,7 +1450,7 @@ async function sendCommandLongToVehicle(
     param6: params.param6 ?? 0,
     param7: params.param7 ?? 0,
   });
-  const packet = await sendMavlinkPacket(COMMAND_LONG_ID, payload, COMMAND_LONG_CRC_EXTRA);
+  const packet = await sendMavlinkPacket(COMMAND_LONG_ID, payload, COMMAND_LONG_CRC_EXTRA, { link: target.transport });
   await target.transport.write(packet);
   connectionState.packetsSent++;
   return true;
@@ -1925,9 +1927,18 @@ let paramListRetries = 0; // Re-sends of PARAM_REQUEST_LIST when nothing arrived
 let paramStalledRounds = 0; // Consecutive stall recoveries that yielded zero new params
 let paramProgressAtLastStall = 0;
 let paramInactivityMs = 10000; // Computed per-link at download start
+// Gap-fill rounds are targeted reads, so they wait on a short round-trip budget
+// rather than the long "is the FC still streaming?" inactivity window.
+let paramGapFillMode = false;
+let paramGapRoundMs = 3000;
+let paramGapChunk = 30;
+let paramGapCursor = 0; // Rotates so an index the FC never returns can't starve the rest
+let paramGapSendGapMs = 0;
+let paramRecoveryInFlight = false;
+/** Indices requested in the current gap-fill round and still outstanding. */
+const paramRoundPending = new Set<number>();
 const PARAM_LIST_MAX_RETRIES = 3;
-const PARAM_MAX_STALLED_ROUNDS = 3;
-const PARAM_GAP_FILL_CHUNK = 30; // Reads per recovery round; keeps the uplink of slow radios breathable
+const PARAM_MAX_STALLED_ROUNDS = 10;
 
 // Resolve the MAV_PARAM_TYPE to put on the wire for a PARAM_SET.
 // ArduPilot stores all params as float32 over MAVLink and expects REAL32 (9)
@@ -3520,9 +3531,19 @@ function parseTelemetry(mainWindow: BrowserWindow, packet: MAVLinkPacket): void 
         console.error('[ipc-handlers] pending param read callback threw', err);
       }
 
-      // Reset the stall timer on each received param during a bulk download
+      // Reset the stall timer on each received param during a bulk download.
+      // In gap-fill mode a round that fills completely starts the next one at
+      // link speed instead of idling out the round budget.
       if (paramDownloadActive) {
-        armParamInactivityTimer(mainWindow);
+        paramRoundPending.delete(param.paramIndex);
+        if (paramGapFillMode && !paramRecoveryInFlight && paramRoundPending.size === 0
+            && receivedParams.size < param.paramCount) {
+          if (paramDownloadTimeout) clearTimeout(paramDownloadTimeout);
+          paramDownloadTimeout = null;
+          setImmediate(() => void recoverParamDownload(mainWindow));
+        } else {
+          armParamInactivityTimer(mainWindow);
+        }
       }
 
       // Send parameter to renderer
@@ -3546,6 +3567,8 @@ function parseTelemetry(mainWindow: BrowserWindow, packet: MAVLinkPacket): void 
       // Check if bulk download is complete (only during active download, not after individual PARAM_SET responses)
       if (paramDownloadActive && receivedParams.size >= param.paramCount) {
         paramDownloadActive = false;
+        paramGapFillMode = false;
+        paramRoundPending.clear();
         if (paramDownloadTimeout) {
           clearTimeout(paramDownloadTimeout);
           paramDownloadTimeout = null;
@@ -3836,19 +3859,36 @@ function paramInactivityTimeoutMs(link: { type?: string; baudRate?: number } | n
   return 10000;
 }
 
-function missingParamIndices(expected: number, seen: ReadonlySet<number>, limit: number): number[] {
+/**
+ * Missing indices starting from `cursor`, wrapping once. Scanning from 0 every
+ * round means an index the FC never returns pins the window to the same first
+ * `limit` gaps forever; the cursor walks past it instead.
+ */
+function missingParamIndices(expected: number, seen: ReadonlySet<number>, limit: number, cursor: number): number[] {
   const missing: number[] = [];
-  for (let i = 0; i < expected && missing.length < limit; i++) {
+  const start = expected > 0 ? cursor % expected : 0;
+  for (let n = 0; n < expected && missing.length < limit; n++) {
+    const i = (start + n) % expected;
     if (!seen.has(i)) missing.push(i);
   }
   return missing;
+}
+
+/**
+ * Per-round budget for gap-fill reads. Unlike the initial stall window this
+ * only has to cover one request/response round trip, so it stays short even on
+ * slow radios; rounds that fill early are kicked off by the PARAM_VALUE handler.
+ */
+function paramGapRoundTimeoutMs(link: { type?: string; baudRate?: number } | null): number {
+  if (link?.type === 'serial' && (link.baudRate ?? 115200) <= 57600) return 5000;
+  return 2500;
 }
 
 function armParamInactivityTimer(mainWindow: BrowserWindow): void {
   if (paramDownloadTimeout) clearTimeout(paramDownloadTimeout);
   paramDownloadTimeout = setTimeout(() => {
     void recoverParamDownload(mainWindow);
-  }, paramInactivityMs);
+  }, paramGapFillMode ? paramGapRoundMs : paramInactivityMs);
 }
 
 /**
@@ -3866,8 +3906,14 @@ function armParamInactivityTimer(mainWindow: BrowserWindow): void {
 async function recoverParamDownload(mainWindow: BrowserWindow): Promise<void> {
   paramDownloadTimeout = null;
   if (!paramDownloadActive) return;
+  if (paramRecoveryInFlight) {
+    // A round is still going out; let it finish and re-arm rather than overlapping.
+    armParamInactivityTimer(mainWindow);
+    return;
+  }
   if (!currentTransport?.isOpen || !connectionState.isConnected) {
     paramDownloadActive = false;
+    paramGapFillMode = false;
     return;
   }
 
@@ -3905,33 +3951,50 @@ async function recoverParamDownload(mainWindow: BrowserWindow): Promise<void> {
 
   if (paramStalledRounds >= PARAM_MAX_STALLED_ROUNDS) {
     paramDownloadActive = false;
+    paramGapFillMode = false;
     safeSend(mainWindow, IPC_CHANNELS.PARAM_ERROR,
       `Timeout: received ${receivedParams.size}/${expectedParamCount} parameters`);
     return;
   }
 
-  const missing = missingParamIndices(expectedParamCount, receivedParamIndices, PARAM_GAP_FILL_CHUNK);
+  const missing = missingParamIndices(expectedParamCount, receivedParamIndices, paramGapChunk, paramGapCursor);
   if (missing.length === 0) {
     // Every index arrived but the by-name map is smaller (duplicate ids).
     // Nothing left to fetch; call it complete.
     paramDownloadActive = false;
+    paramGapFillMode = false;
     safeSend(mainWindow, IPC_CHANNELS.PARAM_COMPLETE);
     return;
   }
 
-  sendLog(mainWindow, 'info',
-    `Parameter stream stalled at ${receivedParamIndices.size}/${expectedParamCount}, re-requesting ${missing.length} missing parameters`);
+  paramGapCursor = (missing[missing.length - 1]! + 1) % Math.max(expectedParamCount, 1);
+  if (!paramGapFillMode) {
+    paramGapFillMode = true;
+    sendLog(mainWindow, 'info',
+      `Parameter stream stalled at ${receivedParamIndices.size}/${expectedParamCount}, filling gaps by direct read`);
+  }
+
+  paramRoundPending.clear();
+  for (const paramIndex of missing) paramRoundPending.add(paramIndex);
+  // Arm before sending: a fast link can answer the first read while the rest are
+  // still being written, and that handler needs a timer it can cancel.
+  armParamInactivityTimer(mainWindow);
+
+  paramRecoveryInFlight = true;
   try {
     for (const paramIndex of missing) {
       const payload = serializeParamRequestRead({ targetSystem, targetComponent, paramId: '', paramIndex });
       const packet = await sendMavlinkPacket(PARAM_REQUEST_READ_ID, payload, PARAM_REQUEST_READ_CRC_EXTRA);
       await currentTransport.write(packet);
       connectionState.packetsSent++;
+      // Blasting a whole round back to back overruns a SiK radio's uplink buffer.
+      if (paramGapSendGapMs > 0) await new Promise((r) => setTimeout(r, paramGapSendGapMs));
     }
   } catch {
-    // Send failed; the re-armed timer below retries next round.
+    // Send failed; the armed timer retries next round.
+  } finally {
+    paramRecoveryInFlight = false;
   }
-  armParamInactivityTimer(mainWindow);
 }
 
 // Helper: Request a mission item from FC
@@ -3954,7 +4017,7 @@ async function requestMissionItem(mainWindow: BrowserWindow, seq: number, missio
       seq,
       missionType,
     });
-    packet = await sendMavlinkPacket(MISSION_REQUEST_INT_ID, payload, MISSION_REQUEST_INT_CRC_EXTRA);
+    packet = await sendMavlinkPacket(MISSION_REQUEST_INT_ID, payload, MISSION_REQUEST_INT_CRC_EXTRA, { link: transport });
   } else {
     // MAVLink v1 packet but use v2 byte order (size-sorted) for payload!
     // ArduPilot uses v2 byte order internally regardless of packet format.
@@ -3965,7 +4028,7 @@ async function requestMissionItem(mainWindow: BrowserWindow, seq: number, missio
     payload[1] = (seq >> 8) & 0xff;       // seq high byte
     payload[2] = targetSystem & 0xff;     // target_system
     payload[3] = 1;                       // target_component
-    packet = serializeV1(MISSION_REQUEST_ID, payload, MISSION_REQUEST_CRC_EXTRA_V1, { sysid: gcsSysid, compid: 190 });
+    packet = serializeV1(MISSION_REQUEST_ID, payload, MISSION_REQUEST_CRC_EXTRA_V1, { sysid: gcsSysid, compid: 190, sequence: nextTxSeq(transport) });
   }
 
   sendLog(mainWindow, 'debug', `Requesting mission item ${seq} (MAVLink v${detectedMavlinkVersion})`);
@@ -4011,7 +4074,7 @@ async function sendMissionItem(mainWindow: BrowserWindow, item: MissionItem): Pr
       z: item.altitude,
       missionType: MAV_MISSION_TYPE.MISSION,
     });
-    packet = await sendMavlinkPacket(MISSION_ITEM_INT_ID, payload, MISSION_ITEM_INT_CRC_EXTRA);
+    packet = await sendMavlinkPacket(MISSION_ITEM_INT_ID, payload, MISSION_ITEM_INT_CRC_EXTRA, { link: transport });
   } else {
     // MAVLink v1: Use MISSION_ITEM (legacy format with float lat/lon)
     // v1 payload is 37 bytes (no mission_type), v2 is 38 bytes
@@ -4035,7 +4098,7 @@ async function sendMissionItem(mainWindow: BrowserWindow, item: MissionItem): Pr
     // Slice off the last byte (mission_type) for v1
     // v1 path: manual payload without mission_type extension
     const payload = fullPayload.slice(0, 37);
-    packet = serializeV1(MISSION_ITEM_ID, payload, MISSION_ITEM_CRC_EXTRA_V1, { sysid: gcsSysid, compid: 190 });
+    packet = serializeV1(MISSION_ITEM_ID, payload, MISSION_ITEM_CRC_EXTRA_V1, { sysid: gcsSysid, compid: 190, sequence: nextTxSeq(transport) });
   }
 
   sendLog(mainWindow, 'debug', `Sending mission item ${item.seq} (MAVLink v${detectedMavlinkVersion})`);
@@ -4064,7 +4127,7 @@ async function sendMissionAck(mainWindow: BrowserWindow, result: number, mission
       type: result,
       missionType,
     });
-    packet = await sendMavlinkPacket(MISSION_ACK_ID, payload, MISSION_ACK_CRC_EXTRA);
+    packet = await sendMavlinkPacket(MISSION_ACK_ID, payload, MISSION_ACK_CRC_EXTRA, { link: transport });
   } else {
     // MAVLink v1: 3 bytes (no mission_type)
     // v1 path: manual payload without mission_type extension
@@ -4072,7 +4135,7 @@ async function sendMissionAck(mainWindow: BrowserWindow, result: number, mission
     payload[0] = targetSystem & 0xff;
     payload[1] = 1; // target_component
     payload[2] = result & 0xff;
-    packet = serializeV1(MISSION_ACK_ID, payload, MISSION_ACK_CRC_EXTRA_V1, { sysid: gcsSysid, compid: 190 });
+    packet = serializeV1(MISSION_ACK_ID, payload, MISSION_ACK_CRC_EXTRA_V1, { sysid: gcsSysid, compid: 190, sequence: nextTxSeq(transport) });
   }
 
   transport.write(packet).catch(err => {
@@ -4609,7 +4672,7 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
             y: Math.round(cmd.lon * 1e7),
             z: cmd.alt,
           });
-          const packet = await sendMavlinkPacket(COMMAND_INT_ID, payload, COMMAND_INT_CRC_EXTRA);
+          const packet = await sendMavlinkPacket(COMMAND_INT_ID, payload, COMMAND_INT_CRC_EXTRA, { link: target.transport });
           await target.transport.write(packet);
           connectionState.packetsSent++;
           return true;
@@ -6637,7 +6700,7 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
             reqMessageRate: req.hz,
             startStop: 1,
           });
-          const pkt = await sendMavlinkPacket(REQUEST_DATA_STREAM_ID, payload, REQUEST_DATA_STREAM_CRC_EXTRA);
+          const pkt = await sendMavlinkPacket(REQUEST_DATA_STREAM_ID, payload, REQUEST_DATA_STREAM_CRC_EXTRA, { link: pending.transport });
           await pending.transport.write(pkt);
           await new Promise(resolve => setTimeout(resolve, 20));
         } catch {
@@ -6974,6 +7037,13 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
     paramStalledRounds = 0;
     paramProgressAtLastStall = 0;
     paramInactivityMs = paramInactivityTimeoutMs(lastConnectOptions);
+    paramGapRoundMs = paramGapRoundTimeoutMs(lastConnectOptions);
+    paramGapFillMode = false;
+    paramGapCursor = 0;
+    paramRoundPending.clear();
+    const slowSerial = lastConnectOptions?.type === 'serial' && (lastConnectOptions.baudRate ?? 115200) <= 57600;
+    paramGapChunk = slowSerial ? 20 : 60;
+    paramGapSendGapMs = slowSerial ? 30 : 0;
     paramDownloadActive = true;
     paramDownloadStartTime = Date.now();
 
@@ -7750,7 +7820,7 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
           chan13Raw: IGNORE, chan14Raw: IGNORE, chan15Raw: IGNORE, chan16Raw: IGNORE,
           chan17Raw: IGNORE, chan18Raw: IGNORE,
         });
-        const rcPacket = await sendMavlinkPacket(RC_CHANNELS_OVERRIDE_ID, rcPayload, RC_CHANNELS_OVERRIDE_CRC_EXTRA);
+        const rcPacket = await sendMavlinkPacket(RC_CHANNELS_OVERRIDE_ID, rcPayload, RC_CHANNELS_OVERRIDE_CRC_EXTRA, { link: target.transport });
         await target.transport.write(rcPacket);
         // Give ArduPilot time to process the RC input
         await new Promise(resolve => setTimeout(resolve, 500));
@@ -7770,7 +7840,7 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
         param7: 0,
       });
 
-      const packet = await sendMavlinkPacket(COMMAND_LONG_ID, payload, COMMAND_LONG_CRC_EXTRA);
+      const packet = await sendMavlinkPacket(COMMAND_LONG_ID, payload, COMMAND_LONG_CRC_EXTRA, { link: target.transport });
       await target.transport.write(packet);
       connectionState.packetsSent++;
 
@@ -7836,7 +7906,7 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
         param6: 0,
         param7: 0,
       });
-      const cmdPacket = await sendMavlinkPacket(COMMAND_LONG_ID, cmdPayload, COMMAND_LONG_CRC_EXTRA);
+      const cmdPacket = await sendMavlinkPacket(COMMAND_LONG_ID, cmdPayload, COMMAND_LONG_CRC_EXTRA, { link: target.transport });
       await target.transport.write(cmdPacket);
       connectionState.packetsSent++;
 
@@ -7846,7 +7916,7 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
         baseMode,
         customMode,
       });
-      const setModePacket = await sendMavlinkPacket(SET_MODE_ID, setModePayload, SET_MODE_CRC_EXTRA);
+      const setModePacket = await sendMavlinkPacket(SET_MODE_ID, setModePayload, SET_MODE_CRC_EXTRA, { link: target.transport });
       await target.transport.write(setModePacket);
       connectionState.packetsSent++;
 
@@ -7898,7 +7968,7 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
         y: 0,             // lon unused for VTOL takeoff
         z: altitude,      // home-relative metres
       });
-      const packet = await sendMavlinkPacket(COMMAND_INT_ID, payload, COMMAND_INT_CRC_EXTRA);
+      const packet = await sendMavlinkPacket(COMMAND_INT_ID, payload, COMMAND_INT_CRC_EXTRA, { link: target.transport });
       await target.transport.write(packet);
       connectionState.packetsSent++;
       sendLog(mainWindow, 'info', `Sent VTOL_TAKEOFF (COMMAND_INT, rel-alt=${altitude}m) to sysid ${target.sysid}`);
@@ -7937,7 +8007,7 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
         param7: altitude,
       });
 
-      const packet = await sendMavlinkPacket(COMMAND_LONG_ID, payload, COMMAND_LONG_CRC_EXTRA);
+      const packet = await sendMavlinkPacket(COMMAND_LONG_ID, payload, COMMAND_LONG_CRC_EXTRA, { link: target.transport });
       await target.transport.write(packet);
       connectionState.packetsSent++;
 
@@ -7989,7 +8059,7 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
         z: alt,             // altitude (meters, relative to the frame above)
       });
 
-      const packet = await sendMavlinkPacket(COMMAND_INT_ID, payload, COMMAND_INT_CRC_EXTRA);
+      const packet = await sendMavlinkPacket(COMMAND_INT_ID, payload, COMMAND_INT_CRC_EXTRA, { link: target.transport });
       await target.transport.write(packet);
       connectionState.packetsSent++;
       lastGotoFrameBySysid.set(target.sysid, altFrame);
@@ -8044,7 +8114,7 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
         z: alt,
       });
 
-      const packet = await sendMavlinkPacket(COMMAND_INT_ID, payload, COMMAND_INT_CRC_EXTRA);
+      const packet = await sendMavlinkPacket(COMMAND_INT_ID, payload, COMMAND_INT_CRC_EXTRA, { link: target.transport });
       await target.transport.write(packet);
       connectionState.packetsSent++;
 
@@ -8080,7 +8150,7 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
         z: 0,               // landing altitude (ignored on touchdown)
       });
 
-      const packet = await sendMavlinkPacket(COMMAND_INT_ID, payload, COMMAND_INT_CRC_EXTRA);
+      const packet = await sendMavlinkPacket(COMMAND_INT_ID, payload, COMMAND_INT_CRC_EXTRA, { link: target.transport });
       await target.transport.write(packet);
       connectionState.packetsSent++;
 
@@ -8122,7 +8192,7 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
         y: Math.round(lon * 1e7),
         z: alt,
       });
-      const packet = await sendMavlinkPacket(COMMAND_INT_ID, payload, COMMAND_INT_CRC_EXTRA);
+      const packet = await sendMavlinkPacket(COMMAND_INT_ID, payload, COMMAND_INT_CRC_EXTRA, { link: target.transport });
       await target.transport.write(packet);
       connectionState.packetsSent++;
       sendLog(mainWindow, 'info', `Sent USER_${cmdId - 31009} lat=${lat.toFixed(7)} lon=${lon.toFixed(7)} alt=${alt} p1=${param1} p2=${param2}`);
@@ -9574,14 +9644,14 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
           targetComponent: 1,
           missionType: MAV_MISSION_TYPE.MISSION,
         });
-        packet = await sendMavlinkPacket(MISSION_REQUEST_LIST_ID, payload, MISSION_REQUEST_LIST_CRC_EXTRA);
+        packet = await sendMavlinkPacket(MISSION_REQUEST_LIST_ID, payload, MISSION_REQUEST_LIST_CRC_EXTRA, { link: target.transport });
       } else {
         // MAVLink v1: manual payload (no mission_type)
         // v1 path: manual payload without mission_type extension
         const payload = new Uint8Array(2);
         payload[0] = targetSystem & 0xff;
         payload[1] = 1; // target_component
-        packet = serializeV1(MISSION_REQUEST_LIST_ID, payload, MISSION_REQUEST_LIST_CRC_EXTRA_V1, { sysid: gcsSysid, compid: 190 });
+        packet = serializeV1(MISSION_REQUEST_LIST_ID, payload, MISSION_REQUEST_LIST_CRC_EXTRA_V1, { sysid: gcsSysid, compid: 190, sequence: nextTxSeq(target.transport) });
       }
 
       await target.transport.write(packet);
@@ -9654,7 +9724,7 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
         payload[2] = targetSystem & 0xff;         // target_system
         payload[3] = 1;                           // target_component
         console.log(`[MISSION UPLOAD] v1 payload: ${Array.from(payload).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
-        packet = serializeV1(MISSION_COUNT_ID, payload, MISSION_COUNT_CRC_EXTRA_V1, { sysid: gcsSysid, compid: 190 });
+        packet = serializeV1(MISSION_COUNT_ID, payload, MISSION_COUNT_CRC_EXTRA_V1, { sysid: gcsSysid, compid: 190, sequence: nextTxSeq(currentTransport) });
       }
 
       console.log(`[MISSION UPLOAD] Full packet (${packet.length} bytes): ${Array.from(packet).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
@@ -9723,14 +9793,14 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
               count: total,
               missionType: MAV_MISSION_TYPE.MISSION,
             });
-            packet = await sendMavlinkPacket(MISSION_COUNT_ID, payload, MISSION_COUNT_CRC_EXTRA);
+            packet = await sendMavlinkPacket(MISSION_COUNT_ID, payload, MISSION_COUNT_CRC_EXTRA, { link: target.transport });
           } else {
             const payload = new Uint8Array(4);
             payload[0] = total & 0xff;
             payload[1] = (total >> 8) & 0xff;
             payload[2] = target.sysid & 0xff;
             payload[3] = 1;
-            packet = serializeV1(MISSION_COUNT_ID, payload, MISSION_COUNT_CRC_EXTRA_V1, { sysid: gcsSysid, compid: 190 });
+            packet = serializeV1(MISSION_COUNT_ID, payload, MISSION_COUNT_CRC_EXTRA_V1, { sysid: gcsSysid, compid: 190, sequence: nextTxSeq(target.transport) });
           }
           await target.transport.write(packet);
           connectionState.packetsSent++;
@@ -9818,7 +9888,7 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
           targetComponent: 1,
           seq,
         });
-        packet = await sendMavlinkPacket(MISSION_SET_CURRENT_ID, payload, MISSION_SET_CURRENT_CRC_EXTRA);
+        packet = await sendMavlinkPacket(MISSION_SET_CURRENT_ID, payload, MISSION_SET_CURRENT_CRC_EXTRA, { link: target.transport });
       } else {
         // MAVLink v1 packet but use v2 byte order (size-sorted) for payload!
         // ArduPilot uses v2 byte order internally regardless of packet format.
@@ -9828,7 +9898,7 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
         payload[1] = (seq >> 8) & 0xff;       // seq high byte
         payload[2] = targetSystem & 0xff;     // target_system
         payload[3] = 1;                       // target_component
-        packet = serializeV1(MISSION_SET_CURRENT_ID, payload, MISSION_SET_CURRENT_CRC_EXTRA, { sysid: gcsSysid, compid: 190 });
+        packet = serializeV1(MISSION_SET_CURRENT_ID, payload, MISSION_SET_CURRENT_CRC_EXTRA, { sysid: gcsSysid, compid: 190, sequence: nextTxSeq(target.transport) });
       }
 
       await target.transport.write(packet);
@@ -9994,7 +10064,7 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
         payload[0] = targetSystem & 0xff;
         payload[1] = 1;
         payload[2] = MAV_MISSION_TYPE.FENCE;
-        packet = serializeV1(MISSION_REQUEST_LIST_ID, payload, MISSION_REQUEST_LIST_CRC_EXTRA_V1, { sysid: gcsSysid, compid: 190 });
+        packet = serializeV1(MISSION_REQUEST_LIST_ID, payload, MISSION_REQUEST_LIST_CRC_EXTRA_V1, { sysid: gcsSysid, compid: 190, sequence: nextTxSeq(currentTransport) });
       }
 
       await currentTransport.write(packet);
@@ -10053,7 +10123,7 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
         payload[2] = targetSystem & 0xff;
         payload[3] = 1;
         payload[4] = MAV_MISSION_TYPE.FENCE;
-        packet = serializeV1(MISSION_COUNT_ID, payload, MISSION_COUNT_CRC_EXTRA_V1, { sysid: gcsSysid, compid: 190 });
+        packet = serializeV1(MISSION_COUNT_ID, payload, MISSION_COUNT_CRC_EXTRA_V1, { sysid: gcsSysid, compid: 190, sequence: nextTxSeq(currentTransport) });
       }
 
       await currentTransport.write(packet);
@@ -10208,7 +10278,7 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
         payload[0] = targetSystem & 0xff;
         payload[1] = 1;
         payload[2] = MAV_MISSION_TYPE.RALLY;
-        packet = serializeV1(MISSION_REQUEST_LIST_ID, payload, MISSION_REQUEST_LIST_CRC_EXTRA_V1, { sysid: gcsSysid, compid: 190 });
+        packet = serializeV1(MISSION_REQUEST_LIST_ID, payload, MISSION_REQUEST_LIST_CRC_EXTRA_V1, { sysid: gcsSysid, compid: 190, sequence: nextTxSeq(currentTransport) });
       }
 
       await currentTransport.write(packet);
@@ -10267,7 +10337,7 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
         payload[2] = targetSystem & 0xff;
         payload[3] = 1;
         payload[4] = MAV_MISSION_TYPE.RALLY;
-        packet = serializeV1(MISSION_COUNT_ID, payload, MISSION_COUNT_CRC_EXTRA_V1, { sysid: gcsSysid, compid: 190 });
+        packet = serializeV1(MISSION_COUNT_ID, payload, MISSION_COUNT_CRC_EXTRA_V1, { sysid: gcsSysid, compid: 190, sequence: nextTxSeq(currentTransport) });
       }
 
       await currentTransport.write(packet);

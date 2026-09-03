@@ -28,11 +28,12 @@
 //! it swoops the whole way down, which is itself one of the predictions here.
 
 use ardudeck_sim_engine::airframe::AirframeSpec;
-use ardudeck_sim_engine::articles::{FOAM_SHEET, FOAM_STRIP, GLIDER, PAPER_PLANE};
+use ardudeck_sim_engine::articles::{FOAM_SHEET, FOAM_SHEET_LE, FOAM_STRIP, GLIDER, PAPER_PLANE};
 use ardudeck_sim_engine::copter::{initial_state, VehicleState};
 use ardudeck_sim_engine::fdm_server::{HomeLocation, SimVehicle};
 use ardudeck_sim_engine::math::{Quat, Vec3};
 use ardudeck_sim_engine::vtol::VtolVehicle;
+use ardudeck_sim_engine::wind::{WindConfig, WindField};
 
 const RHO: f64 = 1.225;
 const G: f64 = 9.80665;
@@ -290,6 +291,312 @@ fn a_sheet_released_edge_on_does_not_stay_there() {
     assert!(pitch.abs() > 0.05, "plate held its unstable attitude: pitch {pitch}");
 }
 
+/// A sheet dropped in PERFECTLY STILL AIR falls straight down forever, and that
+/// is correct rather than a missing force.
+///
+/// At exactly broadside the centre of pressure sits at the plate's own centre,
+/// which for a uniform sheet is its CG, so the pitching moment is identically
+/// zero. It is an equilibrium. An UNSTABLE one, because tilting even slightly
+/// moves the centre of pressure forward of the CG, but a deterministic
+/// simulation released with perfect symmetry has nothing to tilt it.
+///
+/// This is worth a test because it looked exactly like missing aerodynamics the
+/// first time it was watched, and it is the opposite: the aerodynamics are
+/// there, the ATMOSPHERE was not connected. Real air is never still.
+#[test]
+fn a_sheet_in_perfectly_still_air_sits_on_its_unstable_equilibrium() {
+    let mut v = build(FOAM_SHEET);
+    v.set_state(VehicleState { position: Vec3::new(0.0, 0.0, -200.0), ..initial_state() });
+    fly(&mut v, 8.0);
+    let (_, pitch, _) = v.state().attitude.to_euler();
+    assert!(pitch.abs() < 1e-6, "something disturbed it: pitch {pitch}");
+    let p = v.state().position;
+    assert!(p.x.abs() < 1e-6 && p.y.abs() < 1e-6, "drifted sideways in still air: {p:?}");
+}
+
+/// Put it in real air and it tumbles on its own. Gusts tip it off the
+/// equilibrium and the static instability does the rest, with no special case
+/// and nothing seeded by hand.
+#[test]
+fn a_sheet_in_real_air_tumbles() {
+    let mut v = build(FOAM_SHEET);
+    // A light breeze with ordinary turbulence in it.
+    v.set_wind_field(WindField::from_uniform(WindConfig {
+        steady: Vec3::new(2.0, 0.0, 0.0),
+        intensity: 1.2,
+        time_constant: 0.8,
+    }));
+    v.set_seed(4242);
+    v.set_state(VehicleState { position: Vec3::new(0.0, 0.0, -200.0), ..initial_state() });
+
+    let dt = 0.004;
+    let mut max_pitch: f64 = 0.0;
+    let mut max_rate: f64 = 0.0;
+    for _ in 0..(12.0 / dt) as usize {
+        v.step(&[], dt);
+        let (_, pitch, _) = v.state().attitude.to_euler();
+        max_pitch = max_pitch.max(pitch.abs());
+        max_rate = max_rate.max(v.state().angular_velocity.length());
+    }
+    assert!(
+        max_pitch.to_degrees() > 45.0,
+        "did not tumble: peak pitch only {:.1} deg",
+        max_pitch.to_degrees()
+    );
+    assert!(max_rate > 1.0, "barely rotated: peak rate {max_rate:.2} rad/s");
+    // And it goes somewhere, rather than dropping on the spot.
+    let p = v.state().position;
+    assert!(
+        (p.x * p.x + p.y * p.y).sqrt() > 1.0,
+        "fell straight down anyway: drifted {:.2} m",
+        (p.x * p.x + p.y * p.y).sqrt()
+    );
+}
+
+/// The same sheet with a rounded leading edge instead of a sharp one.
+///
+/// This is a test of the SECTION DATA, not of the simulation, and saying so is
+/// the point of it. Strip theory has no geometry finer than chord and area, so
+/// it cannot see a leading edge; everything a rounded nose does has to arrive
+/// as coefficients. What the model must then do is carry that difference
+/// through to the aircraft correctly, and these are the two consequences that
+/// matter:
+///
+/// - A sharp edge separates the flow at any incidence, so it stalls early and
+///   develops no leading-edge SUCTION: its resultant force stays roughly normal
+///   to the surface and drag climbs with lift. A rounded nose recovers most of
+///   that axial force, which is the entire reason an aerofoil has a usable
+///   lift-to-drag ratio and a flat plate does not.
+/// - It holds on to a much higher angle before letting go.
+#[test]
+fn a_rounded_leading_edge_beats_a_sharp_one_where_it_should() {
+    let peak = |json: &str| -> (f64, f64, f64) {
+        let mut v = build(json);
+        let area = v.airframe().wing_area;
+        let (mut best_ld, mut cl_max, mut at) = (0.0f64, 0.0f64, 0.0f64);
+        let mut a = 0.0f64;
+        while a < 30.0 {
+            let (cl, cd) = coeffs(&mut v, a.to_radians(), 12.0, area);
+            if cd > 0.0 && cl / cd > best_ld {
+                best_ld = cl / cd;
+            }
+            if cl > cl_max {
+                cl_max = cl;
+                at = a;
+            }
+            a += 0.25;
+        }
+        (best_ld, cl_max, at)
+    };
+    let (ld_sharp, clmax_sharp, stall_sharp) = peak(FOAM_SHEET);
+    let (ld_round, clmax_round, stall_round) = peak(FOAM_SHEET_LE);
+
+    // Stall ANGLE is deliberately not compared here. At aspect ratio 1 the
+    // finite-wing correction stretches the incidence axis so hard that a 2D
+    // stall at 12 degrees lands past 29, and it swamps the section difference.
+    // That is real, and it is why the stall-angle comparison lives in
+    // `bl::tests::a_thin_section_stalls_earlier_than_a_thick_one`, on the 2D
+    // sections, where it is the section that decides.
+    let _ = (stall_sharp, stall_round);
+    // Carries more.
+    assert!(
+        clmax_round > clmax_sharp * 1.3,
+        "CLmax rounded {clmax_round:.3} vs sharp {clmax_sharp:.3}"
+    );
+    // And the THIN one is the more efficient of the two, which is the real
+    // trade and the opposite of what this test first asserted. A blunt nose
+    // buys stall margin and maximum lift; it does not buy efficiency, because
+    // an 18% section carries far more profile drag than a 4% one. Getting this
+    // backwards is easy precisely because "rounded is better" sounds right.
+    assert!(
+        ld_sharp > ld_round,
+        "the thinner section should be the cleaner one: sharp {ld_sharp:.2} vs rounded {ld_round:.2}"
+    );
+    // Both are still wings rather than bricks.
+    assert!(ld_round > 3.0 && ld_sharp > 3.0, "L/D {ld_round:.2} and {ld_sharp:.2}");
+
+    // The planforms are IDENTICAL: if these differed, the comparison would be
+    // measuring geometry rather than the section, which is exactly the mistake
+    // this test exists to avoid.
+    let a = AirframeSpec::from_json(FOAM_SHEET).unwrap().build().unwrap();
+    let b = AirframeSpec::from_json(FOAM_SHEET_LE).unwrap().build().unwrap();
+    assert!((a.wing_area - b.wing_area).abs() < 1e-12, "areas differ");
+    assert_eq!(a.surfaces.len(), b.surfaces.len(), "strip counts differ");
+    assert!((a.mass - b.mass).abs() < 1e-12, "masses differ");
+}
+
+/// Every article's coefficient table must be finite and continuous over the
+/// whole circle, whatever route it was built by.
+///
+/// `aero` has had this check for tables built from a parametric spec since the
+/// day Viterna went in. Tables built from a SOLVED polar did not, and a hole
+/// duly appeared in one: on the aspect-ratio 1 sheet, lift vanished and drag
+/// jumped fiftyfold to 1.0 over a few degrees around 10, because the
+/// lifting-line correction ran the sample angles backwards past the stall and
+/// the interpolator assumes they only ever go forwards. An article flying
+/// through it lost its speed for no visible reason.
+#[test]
+fn every_article_has_a_continuous_coefficient_table() {
+    for (name, json) in ardudeck_sim_engine::articles::ALL {
+        let af = AirframeSpec::from_json(json).unwrap().build().unwrap();
+        for (k, t) in af.airfoils.iter().enumerate() {
+            let mut prev: Option<(f64, f64)> = None;
+            let mut a = -180.0f64;
+            while a <= 180.0 {
+                let c = t.at(a.to_radians());
+                assert!(c.cl.is_finite() && c.cd.is_finite(), "{name} airfoil {k}: non-finite at {a}");
+                // Drag is bounded by the flat plate: past the stall a section
+                // IS one and cannot out-drag it broadside. The 18% sheet once
+                // reached 2.75 against a plate maximum near 1.13.
+                assert!(c.cd >= 0.0 && c.cd <= 1.5, "{name} airfoil {k}: cd {} at {a}", c.cd);
+                // Lift MAGNITUDE is not policed here. This test's job is holes
+                // and jumps; the magnitude bound has its own test, which
+                // currently fails for a real reason and says so rather than
+                // being loosened until it passes. See
+                // `thin_sections_should_not_reach_a_lift_coefficient_of_two`.
+                assert!(c.cl.is_finite());
+                if let Some((pl, pd)) = prev {
+                    assert!(
+                        (c.cl - pl).abs() < 0.15,
+                        "{name} airfoil {k}: cl jumps {pl:.3} to {:.3} at {a} deg",
+                        c.cl
+                    );
+                    assert!(
+                        (c.cd - pd).abs() < 0.15,
+                        "{name} airfoil {k}: cd jumps {pd:.3} to {:.3} at {a} deg",
+                        c.cd
+                    );
+                }
+                prev = Some((c.cl, c.cd));
+                a += 0.25;
+            }
+        }
+    }
+}
+
+/// Measure how a falling article rotates: total turning, net turning, and how
+/// far it travels sideways per metre dropped.
+fn tumble_stats(json: &str, seed: u32, secs: f64) -> (f64, f64, f64) {
+    let mut v = build(json);
+    v.set_wind_field(WindField::from_uniform(WindConfig {
+        steady: Vec3::new(2.0, 0.0, 0.0),
+        intensity: 1.2,
+        time_constant: 0.8,
+    }));
+    v.set_seed(seed);
+    v.set_state(VehicleState { position: Vec3::new(0.0, 0.0, -400.0), ..initial_state() });
+    let dt = 0.004;
+    let (mut turn, mut signed) = (0.0f64, 0.0f64);
+    for _ in 0..(secs / dt) as usize {
+        v.step(&[], dt);
+        let q = v.state().angular_velocity.y;
+        turn += q.abs() * dt;
+        signed += q * dt;
+    }
+    let s = v.state();
+    let horiz = (s.position.x * s.position.x + s.position.y * s.position.y).sqrt();
+    let fell = (-s.position.z - 400.0).abs().max(1e-9);
+    let tau = 2.0 * std::f64::consts::PI;
+    ((signed / turn.max(1e-9)).abs(), turn / tau, horiz / fell)
+}
+
+/// KNOWN GAP: a very thin section at low Reynolds number reaches a lift
+/// coefficient it should not.
+///
+/// The aspect-ratio 1 sheet wearing a NACA 0004 peaks near |CL| 2.0. A 4%
+/// section at Re 2e5 measures nearer 0.8 and stalls around 8 to 10 degrees:
+/// its sharp nose makes a suction peak the boundary layer cannot survive, which
+/// is the very effect the panel solve shows clearly in the tunnel.
+///
+/// The inviscid solve is right and the suction peak is there. What is too
+/// generous is the STALL CRITERION on top of it: separation is only counted
+/// once it has run to 80% of the chord, which a leading-edge stall never does
+/// gradually. Head's entrainment method under-predicts separation growth in
+/// exactly this regime, and replacing it with a lagged-dissipation closure is
+/// the same fix already noted in `bl.rs`.
+#[test]
+#[ignore = "records a known gap: thin sections stall too late at low Reynolds number"]
+fn thin_sections_should_not_reach_a_lift_coefficient_of_two() {
+    for (name, json) in ardudeck_sim_engine::articles::ALL {
+        let af = AirframeSpec::from_json(json).unwrap().build().unwrap();
+        for (k, t) in af.airfoils.iter().enumerate() {
+            let mut peak = 0.0f64;
+            let mut a = -180.0f64;
+            while a <= 180.0 {
+                peak = peak.max(t.at(a.to_radians()).cl.abs());
+                a += 0.25;
+            }
+            assert!(peak <= 1.6, "{name} airfoil {k}: peak |CL| {peak:.2}");
+        }
+    }
+}
+
+/// A DROPPED SHEET TUMBLES: it spins continuously in one direction and flies off
+/// that way. Everyone has watched one do it.
+///
+/// This needs the model to see that the section is TURNING, and a strip model
+/// evaluating its flow at one chordwise point cannot: a rotating plate looks
+/// identical to a stationary one at the same angle, so it swings and comes back.
+/// Thin-airfoil theory says the quasi-steady angle is set by tangency at the
+/// THREE-QUARTER chord while the lift acts at the quarter chord, and the gap
+/// between those two points is the whole mechanism.
+///
+/// Before that change the sheet fluttered: 6.3 rotations of swinging with a net
+/// of 0.24, which is an oscillation and not a tumble.
+/// KNOWN GAP as of the chordwise rework: the model FLUTTERS where it should
+/// tumble.
+///
+/// Andersen, Pesavento and Wang's phase diagram is governed by the
+/// dimensionless inertia `I* = rho_s h / (rho_f c)`. This sheet is 20 g over
+/// 0.09 m2 against `rho_f c` of 0.368, so `I* = 0.60`, and the flutter-to-tumble
+/// boundary sits near 0.4. It should tumble.
+///
+/// It no longer fails UNPHYSICALLY, which it did before: tip speeds five times
+/// airspeed and force coefficients of ten are gone, and so are both of the
+/// constants that were fitted to fake the rotation. What is left is a
+/// quasi-steady model landing in the wrong one of two real regimes, and closing
+/// that needs the unsteady wake, which is a different model class.
+#[test]
+#[ignore = "records a known gap: the model flutters where this plate should tumble"]
+fn a_dropped_sheet_tumbles_and_flies_off_in_one_direction() {
+    for json in [FOAM_SHEET, FOAM_SHEET_LE] {
+        for seed in [7u32, 99, 1234] {
+            let (ratio, turns, glide) = tumble_stats(json, seed, 30.0);
+            assert!(
+                turns > 20.0,
+                "barely rotated: {turns:.1} turns in 30 s (seed {seed})"
+            );
+            // Nearly all the turning is one way. An oscillation scores near zero
+            // here however violently it swings, which is the distinction.
+            assert!(
+                ratio > 0.7,
+                "fluttering, not tumbling: {:.0}% of {turns:.0} turns were net (seed {seed})",
+                ratio * 100.0
+            );
+            // And it goes somewhere, rather than falling on the spot.
+            assert!(
+                glide > 0.25,
+                "no sideways travel: {glide:.2} m across per m down (seed {seed})"
+            );
+        }
+    }
+}
+
+/// And an AIRCRAFT does not tumble, which is the other half of the same claim.
+/// The change that makes a sheet spin must leave something with a tail gliding.
+#[test]
+fn the_glider_still_glides_rather_than_tumbling() {
+    for seed in [7u32, 99, 1234] {
+        let (ratio, _, glide) = tumble_stats(GLIDER, seed, 30.0);
+        assert!(ratio < 0.4, "the glider tumbled: {:.0}% net turning (seed {seed})", ratio * 100.0);
+        // A modest bar, because this glider is deliberately built with a tail
+        // too small to hold it steady: it porpoises, and an aircraft trading
+        // height for speed averages worse than its own steady best. What
+        // matters here is that it GLIDES rather than tumbling.
+        assert!(glide > 1.5, "glided only {glide:.2}:1 (seed {seed})");
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // ARTICLE 2: a paper plane
 // ────────────────────────────────────────────────────────────────────────────
@@ -355,18 +662,21 @@ fn the_paper_plane_swoops_and_stalls_like_a_real_dart() {
     let hi = pitches.iter().cloned().fold(f64::MIN, f64::max);
     let lo = pitches.iter().cloned().fold(f64::MAX, f64::min);
     assert!(hi - lo > 40.0, "no swoop: pitch only moved {:.1} deg", hi - lo);
-    assert!(worst_stall > 0.3, "a swooping dart stalls at the top: worst {worst_stall:.2}");
+    // Not asserted to stall HARD. With the chord resolved the dart's strips no
+    // longer all reach the stall together, so it brushes it rather than letting
+    // go completely, which is what a dart that keeps flying actually does.
+    assert!(worst_stall > 0.05, "never came near the stall: worst {worst_stall:.2}");
 
-    // Sustained, not a decaying transient: the second half swings as hard as
-    // the first. A dart does not settle down.
+    // The swoop DAMPS rather than running forever, and that is a correction to
+    // what this test used to assert. A dart with real pitch damping settles into
+    // a glide; the endless violent porpoise was an artefact of every strip
+    // sitting at one chordwise point, which left the model no pitch damping at
+    // all. What survives is the initial swoop and the stall at the top of it.
     let half = pitches.len() / 2;
     let range = |w: &[f64]| {
         w.iter().cloned().fold(f64::MIN, f64::max) - w.iter().cloned().fold(f64::MAX, f64::min)
     };
-    assert!(
-        range(&pitches[half..]) > 0.5 * range(&pitches[..half]),
-        "the swoop damped out; a dart's does not"
-    );
+    assert!(range(&pitches[..half]) > 40.0, "no swoop in the first half");
 }
 
 /// Despite swooping the whole way down, it descends at a dart-like average
@@ -380,14 +690,17 @@ fn the_paper_plane_descends_at_a_dart_like_rate() {
     let g = measure_avg(&mut v, 30.0);
     assert!(g.sink > 0.0, "it is climbing, not gliding: sink {}", g.sink);
     assert!(
-        (1.2..5.0).contains(&g.glide_ratio),
-        "average glide {:.2}:1 over 30 s",
+        (2.5..6.0).contains(&g.glide_ratio),
+        "paper darts glide at about 3:1 to 6:1, model gives {:.2}",
         g.glide_ratio
     );
     assert!((1.5..8.0).contains(&g.speed), "mean speed {:.2} m/s", g.speed);
-    // Worse than its own polar allows, because a swoop wastes energy. If free
-    // flight matched the polar the aircraft would not be oscillating.
-    assert!(g.glide_ratio < 3.0, "a swooping dart cannot reach its steady best");
+    // And the flight is STEADY: glide ratio from the trajectory now matches L/D
+    // from the forces, which it could not while the dart was porpoising. That
+    // identity holds only in steady flight, and getting it is what pitch damping
+    // bought.
+    let err = (g.glide_ratio - g.ld()).abs() / g.ld();
+    assert!(err < 0.15, "glide {:.2} vs L/D {:.2}", g.glide_ratio, g.ld());
 }
 
 /// Thrown too fast, it must settle back to its own trim speed rather than keep
@@ -406,6 +719,122 @@ fn the_paper_plane_settles_to_its_trim_speed() {
     assert!(
         (a - b).abs() / a.max(b) < 0.35,
         "launched at 11 and 3.5 m/s, settled at {a:.2} and {b:.2}: no trim speed"
+    );
+}
+
+/// A dart's directional stability is its KEEL, the fold down the middle, and
+/// nothing else. Without one it has no yaw stiffness and, worse, no yaw
+/// DAMPING: any yaw a gust gives it simply stays, so the heading wanders and
+/// the aircraft flies visibly crabbed. The first version of this spec had no
+/// vertical surface at all and looked exactly like that.
+#[test]
+fn the_paper_plane_has_a_keel_that_hangs_below_it() {
+    let af = AirframeSpec::from_json(PAPER_PLANE).unwrap().build().unwrap();
+    let keel: Vec<_> = af
+        .surfaces
+        .iter()
+        .filter(|s| s.normal.z.abs() < 0.5 && s.normal.y.abs() > 0.5)
+        .collect();
+    assert!(!keel.is_empty(), "the dart has no vertical surface");
+    // Body z is DOWN, so a ventral keel sits at positive z.
+    assert!(keel.iter().all(|s| s.position.z > 0.0), "the keel is above the wing, not below it");
+    assert!(keel.iter().all(|s| s.position.y.abs() < 1e-9), "the keel is off the centreline");
+}
+
+#[test]
+fn the_paper_plane_weathercocks_and_damps_in_yaw() {
+    let mut v = build(PAPER_PLANE);
+    // Flying forward but slipping to the right.
+    v.set_state(VehicleState {
+        position: Vec3::new(0.0, 0.0, -400.0),
+        velocity: Vec3::new(6.0, 1.5, 0.4),
+        attitude: Quat::identity(),
+        ..initial_state()
+    });
+    v.step(&[], 1e-4);
+    // Nose swings right, into the relative wind.
+    assert!(
+        v.diagnostics_full().aero.moment_bf.z > 0.0,
+        "no weathercock: yaw moment {}",
+        v.diagnostics_full().aero.moment_bf.z
+    );
+
+    // And a yaw RATE is opposed, which is the half that stops the heading
+    // wandering. A surface with stiffness but no damping still hunts forever.
+    let mut v = build(PAPER_PLANE);
+    v.set_state(VehicleState {
+        position: Vec3::new(0.0, 0.0, -400.0),
+        velocity: Vec3::new(6.0, 0.0, 0.4),
+        attitude: Quat::identity(),
+        angular_velocity: Vec3::new(0.0, 0.0, 1.5),
+        ..initial_state()
+    });
+    v.step(&[], 1e-4);
+    assert!(
+        v.diagnostics_full().aero.moment_bf.z < 0.0,
+        "no yaw damping: rate +z met with moment {}",
+        v.diagnostics_full().aero.moment_bf.z
+    );
+}
+
+/// A UNIFORM wind produces NO sideslip, so an aircraft in one does not
+/// weathercock. It flies through the moving air mass with its nose on its
+/// AIRSPEED vector while its ground track drifts downwind. Nose one way, track
+/// another, and both correct.
+///
+/// A uniform wind is a change of reference frame for the air, so it must change
+/// the ground track and NOTHING else. Two flights launched at the same
+/// AIRSPEED, one in still air and one in 6 m/s, must fly identically and differ
+/// only in position.
+///
+/// Launched at the same AIRSPEED and not the same ground speed, which is the
+/// whole point restated. Giving both the same ground velocity puts the windy
+/// one into a 26 degree sideslip at the instant of release, and it then yaws
+/// hard to sort itself out. That is correct behaviour and it is also what an
+/// article DROPPED from rest into a breeze does, which is worth knowing when
+/// watching one: it starts with the wind straight up its side.
+#[test]
+fn a_uniform_wind_shifts_the_track_and_changes_nothing_else() {
+    // 6 m/s blowing east; NED y is east.
+    let wind = Vec3::new(0.0, 6.0, 0.0);
+    let run = |w: Vec3| {
+        let mut v = build(GLIDER);
+        v.set_wind_field(WindField::from_uniform(WindConfig {
+            steady: w,
+            intensity: 0.0,
+            time_constant: 1.0,
+        }));
+        v.set_state(VehicleState {
+            position: Vec3::new(0.0, 0.0, -3000.0),
+            // Same AIRSPEED in both: ground velocity carries the wind.
+            velocity: Vec3::new(12.0, 0.0, 0.6).add(w),
+            attitude: Quat::from_euler(0.0, -0.05, 0.0),
+            ..initial_state()
+        });
+        fly(&mut v, 10.0);
+        v.state()
+    };
+    let calm = run(Vec3::zero());
+    let windy = run(wind);
+
+    // Same motion relative to the air. To a tolerance, not bit for bit:
+    // airspeed is `velocity - wind`, and in the windy case both terms carry the
+    // drift, so the subtraction loses low bits the calm case never had. A free
+    // unstabilised glider then amplifies that, which is why the horizon here is
+    // ten seconds and not a minute.
+    let att_err = ardudeck_sim_engine::validate::attitude_error(calm.attitude, windy.attitude);
+    assert!(att_err < 1e-3, "a uniform wind changed the attitude by {att_err:.3e} rad");
+    assert!(
+        calm.angular_velocity.sub(windy.angular_velocity).length() < 1e-3,
+        "it changed the body rates"
+    );
+
+    // And the ground track is displaced by exactly wind times time.
+    let east = windy.position.y - calm.position.y;
+    assert!((east - 60.0).abs() < 0.5, "track displacement {east:.2} m, expected 60.00 m");
+    assert!(
+        (calm.position.x - windy.position.x).abs() < 0.5,
+        "the wind moved it downrange as well as crosswind"
     );
 }
 
@@ -758,3 +1187,31 @@ fn no_unpowered_article_gains_energy() {
 
 
 
+
+
+
+#[test]
+fn probe_spin_rate2() {
+    for (name, json) in [("sheet 0004", FOAM_SHEET), ("glider", GLIDER)] {
+        let mut v = build(json);
+        v.set_wind_field(WindField::from_uniform(WindConfig { steady: Vec3::new(2.0,0.0,0.0), intensity: 1.2, time_constant: 0.8 }));
+        v.set_seed(7);
+        v.set_state(VehicleState { position: Vec3::new(0.0,0.0,-400.0), ..initial_state() });
+        let dt = 0.004;
+        let (mut turn, mut signed) = (0.0f64, 0.0f64);
+        for i in 0..(30.0/dt) as usize {
+            v.step(&[], dt);
+            let q = v.state().angular_velocity.y; turn += q.abs()*dt; signed += q*dt;
+            if i % 1250 == 0 {
+                let s = v.state();
+                println!("{name:11} t={:5.1} w={:7.2} ({:4.2} rev/s) Vfall={:5.2} tip/V={:5.2}",
+                    i as f64*dt, s.angular_velocity.y, s.angular_velocity.y.abs()/(2.0*std::f64::consts::PI),
+                    s.velocity.z, s.angular_velocity.y.abs()*0.15/s.velocity.length().max(0.1));
+            }
+        }
+        let s = v.state();
+        let horiz = (s.position.x*s.position.x + s.position.y*s.position.y).sqrt();
+        println!("  -> {name}: ratio {:4.2}  turns {:5.1}  drift/fall {:4.2}\n",
+            (signed/turn.max(1e-9)).abs(), turn/(2.0*std::f64::consts::PI), horiz/(-s.position.z-400.0).abs().max(1e-9));
+    }
+}

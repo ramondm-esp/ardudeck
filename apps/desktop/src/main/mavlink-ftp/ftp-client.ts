@@ -4,8 +4,9 @@
  * Implements the MAVLink FILE_TRANSFER_PROTOCOL for downloading files
  * from a flight controller's virtual filesystem.
  *
- * Uses sequential ReadFile (request/response per chunk) which is simple,
- * reliable, and fast on USB serial where round-trip latency is <1ms.
+ * Downloads use BurstReadFile (one request, many streamed replies) and patch
+ * anything the link dropped with targeted ReadFile calls, falling back to plain
+ * sequential reads on FCs without burst support.
  *
  * Reference: MissionPlanner MAVFtp.cs, mavlink.io/en/services/ftp.html
  */
@@ -17,6 +18,7 @@ import {
   FTP_READ_SIZE,
   FTP_WRITE_SIZE,
   FTP_TIMEOUT_MS,
+  FTP_BURST_TIMEOUT_MS,
   FTP_MAX_RETRIES,
   type FtpPayload,
   serializeFtpPayload,
@@ -43,6 +45,72 @@ export interface FtpClientOptions {
   readSize?: number;
 }
 
+/** In-flight BurstReadFile collection. */
+interface BurstState {
+  buffer: Uint8Array;
+  mask: Coverage;
+  /** Bytes newly covered by this burst (repeats of already-held bytes don't count). */
+  gained: number;
+  /** Highest file offset the burst has delivered data up to. */
+  reachedEnd: number;
+  finish: (reason: BurstOutcome) => void;
+  timer: NodeJS.Timeout | null;
+  idleMs: number;
+}
+
+type BurstOutcome = 'complete' | 'eof' | 'idle' | 'nak' | 'unsupported';
+
+/** Which bytes of a download have arrived. Bit-packed: an FC log can be 100MB. */
+class Coverage {
+  private bits: Uint8Array;
+  filled = 0;
+
+  constructor(readonly size: number) {
+    this.bits = new Uint8Array((size + 7) >> 3);
+  }
+
+  has(i: number): boolean {
+    return ((this.bits[i >> 3]! >> (i & 7)) & 1) === 1;
+  }
+
+  /** Marks byte `i` received; returns false if it was already held. */
+  add(i: number): boolean {
+    const byte = i >> 3;
+    const bit = 1 << (i & 7);
+    if (this.bits[byte]! & bit) return false;
+    this.bits[byte] = this.bits[byte]! | bit;
+    this.filled++;
+    return true;
+  }
+
+  get complete(): boolean {
+    return this.filled >= this.size;
+  }
+
+  /** First missing byte at or after `from`, or -1 if none. */
+  firstHoleFrom(from: number): number {
+    for (let i = from; i < this.size; i++) {
+      if (!this.has(i)) return i;
+    }
+    return -1;
+  }
+
+  holeRanges(): Array<{ start: number; end: number }> {
+    const ranges: Array<{ start: number; end: number }> = [];
+    let start = -1;
+    for (let i = 0; i < this.size; i++) {
+      if (!this.has(i)) {
+        if (start < 0) start = i;
+      } else if (start >= 0) {
+        ranges.push({ start, end: i });
+        start = -1;
+      }
+    }
+    if (start >= 0) ranges.push({ start, end: this.size });
+    return ranges;
+  }
+}
+
 /** One entry returned by ListDirectory. */
 export type DirectoryEntry =
   | { kind: 'dir'; name: string }
@@ -60,6 +128,12 @@ export class MavlinkFtpClient {
   /** Pending response resolver - set by sendRequest(), resolved by handleResponse() */
   private pendingResolve: ((payload: FtpPayload | null) => void) | null = null;
   private pendingTimer: NodeJS.Timeout | null = null;
+  /** seq_number of the request currently awaiting a response, or null when idle. */
+  private pendingSeq: number | null = null;
+  /** Responses dropped because their seq_number didn't match the live request. */
+  private staleResponses = 0;
+  /** Active BurstReadFile collection, or null when no burst is running. */
+  private burst: BurstState | null = null;
 
   constructor(options: FtpClientOptions) {
     this.sendPacket = options.sendPacket;
@@ -74,22 +148,35 @@ export class MavlinkFtpClient {
   handleResponse(rawPayload: Uint8Array): void {
     const payload = parseFtpPayload(rawPayload);
 
-    if (this.pendingResolve) {
-      if (this.pendingTimer) {
-        clearTimeout(this.pendingTimer);
-        this.pendingTimer = null;
-      }
-      const resolve = this.pendingResolve;
-      this.pendingResolve = null;
-      resolve(payload);
+    // Burst replies stream in unsolicited, so they match no pending seq; the collector keys on their offset.
+    if (this.burst && payload.reqOpcode === FtpOpcode.BurstReadFile) {
+      this.handleBurstPacket(payload);
+      return;
     }
+
+    if (!this.pendingResolve) return;
+
+    // Responses carry request seq + 1. Unmatched ones are late replies to a timed-out
+    // request; accepting them hands the wrong chunk to whatever request replaced it.
+    if (this.pendingSeq !== null && payload.seqNumber !== ((this.pendingSeq + 1) & 0xffff)) {
+      this.staleResponses++;
+      return;
+    }
+
+    if (this.pendingTimer) {
+      clearTimeout(this.pendingTimer);
+      this.pendingTimer = null;
+    }
+    const resolve = this.pendingResolve;
+    this.pendingResolve = null;
+    this.pendingSeq = null;
+    resolve(payload);
   }
 
   // ─── High-level API ──────────────────────────────────────────────────────
 
   /**
    * Download a file from the FC's virtual filesystem.
-   * Uses sequential ReadFile (one request per chunk, waits for response).
    * Returns the file contents as a Uint8Array, or null on failure.
    */
   async downloadFile(
@@ -114,8 +201,12 @@ export class MavlinkFtpClient {
         return new Uint8Array(0);
       }
 
-      // Download using sequential reads
-      const data = await this.sequentialDownload(fileSize, progress);
+      // Burst first: one request streams many chunks back, so a high-RTT link isn't
+      // paying a round trip per 110-byte chunk. Falls through on FCs without burst.
+      let data = await this.burstDownload(fileSize, progress);
+      if (!data) {
+        data = await this.sequentialDownload(fileSize, progress);
+      }
 
       // Cleanup session
       await this.terminateSession();
@@ -125,6 +216,9 @@ export class MavlinkFtpClient {
         return null;
       }
 
+      if (this.staleResponses > 0) {
+        this.log('debug', `FTP: dropped ${this.staleResponses} out-of-sequence replies (lossy link)`);
+      }
       return data;
     } catch (err) {
       this.log('error', `FTP error: ${err instanceof Error ? err.message : String(err)}`);
@@ -135,6 +229,7 @@ export class MavlinkFtpClient {
 
   /** Cleanup: reset all sessions on the FC */
   async cleanup(): Promise<void> {
+    this.burst?.finish('nak');
     try {
       await this.resetSessions();
     } catch { /* ignore */ }
@@ -344,6 +439,7 @@ export class MavlinkFtpClient {
         this.pendingTimer = null;
         const r = this.pendingResolve;
         this.pendingResolve = null;
+        this.pendingSeq = null;
         r?.(null);
       }, timeoutMs);
       const payload = this.buildPayload(fields);
@@ -354,6 +450,7 @@ export class MavlinkFtpClient {
         }
         const r = this.pendingResolve;
         this.pendingResolve = null;
+        this.pendingSeq = null;
         r?.(null);
       });
     });
@@ -705,8 +802,9 @@ export class MavlinkFtpClient {
         return null;
       }
 
-      // chunk may be shorter than requested (near end of file)
-      if (chunk.length === 0) break;
+      // EOF before the declared size: return what we actually hold rather than a
+      // zero-padded buffer the caller can't tell from a full file.
+      if (chunk.length === 0) return result.slice(0, offset);
 
       result.set(chunk, offset);
       offset += chunk.length;
@@ -717,6 +815,163 @@ export class MavlinkFtpClient {
     }
 
     return result;
+  }
+
+  /**
+   * Download via BurstReadFile: one request, many streamed Ack packets.
+   * Lost packets leave holes, so each round restarts the burst at the first
+   * hole until the file is covered. Returns null if the FC doesn't burst or
+   * the holes never fill, leaving the caller to fall back to plain reads.
+   */
+  private async burstDownload(
+    fileSize: number,
+    progress?: FtpProgressCallback,
+  ): Promise<Uint8Array | null> {
+    const buffer = new Uint8Array(fileSize);
+    const mask = new Coverage(fileSize);
+
+    // Sweep the file with bursts, each starting past the last one's coverage.
+    // Restarting at the first hole instead would re-send the whole tail on
+    // every dropped packet, which is exactly the link we can least afford it on.
+    let cursor = 0;
+    let barren = 0;
+    let anyBurstData = false;
+    while (cursor < fileSize && barren < 2) {
+      const start = mask.firstHoleFrom(cursor);
+      if (start < 0) break;
+
+      const outcome = await this.runBurst(start, buffer, mask, progress, fileSize);
+      if (outcome.gained > 0) anyBurstData = true;
+      // A silent first burst means the FC has no BurstReadFile; once bytes have
+      // flowed, silence is just a lost request and the gap pass mops it up.
+      if (outcome.reason === 'unsupported' && !anyBurstData) {
+        this.log('debug', 'FTP: BurstReadFile not supported, using sequential reads');
+        return null;
+      }
+      if (outcome.reason === 'eof') break;
+
+      barren = outcome.gained > 0 ? 0 : barren + 1;
+      cursor = Math.max(outcome.reachedEnd, start + 1);
+    }
+
+    // Whatever the bursts dropped is now a set of small holes; fetch each one
+    // directly rather than replaying the stream.
+    for (let attempt = 0; attempt < FTP_MAX_RETRIES; attempt++) {
+      const holes = mask.holeRanges();
+      if (holes.length === 0) return buffer;
+      if (attempt === 0) {
+        const missing = holes.reduce((n, h) => n + (h.end - h.start), 0);
+        this.log('debug', `FTP: patching ${holes.length} burst gap(s), ${missing} bytes`);
+      }
+
+      let progressed = false;
+      for (const hole of holes) {
+        for (let off = hole.start; off < hole.end; off += this.readSize) {
+          const size = Math.min(this.readSize, hole.end - off);
+          const chunk = await this.readFileChunk(off, size);
+          if (!chunk || chunk.length === 0) break;
+          for (let k = 0; k < chunk.length && off + k < fileSize; k++) {
+            if (!mask.add(off + k)) continue;
+            buffer[off + k] = chunk[k]!;
+            progressed = true;
+          }
+          if (progress) progress(mask.filled, fileSize);
+        }
+      }
+      if (!progressed) break;
+    }
+
+    if (!mask.complete) {
+      this.log('warn', `FTP: burst download incomplete (${mask.filled}/${fileSize} bytes)`);
+      return null;
+    }
+    return buffer;
+  }
+
+  private runBurst(
+    offset: number,
+    buffer: Uint8Array,
+    mask: Coverage,
+    progress: FtpProgressCallback | undefined,
+    fileSize: number,
+  ): Promise<{ reason: BurstOutcome; gained: number; reachedEnd: number }> {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (reason: BurstOutcome) => {
+        if (settled) return;
+        settled = true;
+        const gained = this.burst?.gained ?? 0;
+        const reachedEnd = this.burst?.reachedEnd ?? offset;
+        if (this.burst?.timer) clearTimeout(this.burst.timer);
+        this.burst = null;
+        if (progress) progress(mask.filled, fileSize);
+        resolve({ reason, gained, reachedEnd });
+      };
+
+      this.burst = { buffer, mask, gained: 0, reachedEnd: offset, finish, timer: null, idleMs: FTP_TIMEOUT_MS };
+      this.armBurstTimer();
+
+      const payload = this.buildPayload({
+        opcode: FtpOpcode.BurstReadFile,
+        session: this.sessionId,
+        size: this.readSize,
+        offset,
+        data: new Uint8Array(0),
+      });
+      // A burst reply matches no pending request; don't let handleResponse chase one.
+      this.pendingSeq = null;
+      this.sendPacket(payload).catch(() => finish('idle'));
+    });
+  }
+
+  private armBurstTimer(): void {
+    const burst = this.burst;
+    if (!burst) return;
+    if (burst.timer) clearTimeout(burst.timer);
+    burst.timer = setTimeout(() => {
+      burst.timer = null;
+      burst.finish(burst.gained > 0 ? 'idle' : 'unsupported');
+    }, burst.idleMs);
+  }
+
+  private handleBurstPacket(payload: FtpPayload): void {
+    const burst = this.burst;
+    if (!burst) return;
+
+    if (payload.opcode === FtpOpcode.Nak) {
+      const errCode = payload.data[0] ?? 0;
+      if (errCode === FtpError.EOF) {
+        burst.finish('eof');
+        return;
+      }
+      if (errCode === FtpError.UnknownCommand || errCode === FtpError.InvalidDataSize) {
+        burst.finish(burst.gained > 0 ? 'nak' : 'unsupported');
+        return;
+      }
+      this.log('debug', `FTP: burst NAK ${FTP_ERROR_NAMES[errCode] ?? errCode}`);
+      burst.finish('nak');
+      return;
+    }
+
+    if (payload.opcode !== FtpOpcode.Ack) return;
+
+    const end = Math.min(payload.offset + payload.size, burst.buffer.length);
+    burst.reachedEnd = Math.max(burst.reachedEnd, end);
+    for (let i = payload.offset; i < end; i++) {
+      if (!burst.mask.add(i)) continue;
+      burst.buffer[i] = payload.data[i - payload.offset]!;
+      burst.gained++;
+    }
+
+    // After the first packet the FC is actively streaming, so a much shorter gap
+    // means "burst is over" instead of another full round-trip timeout.
+    burst.idleMs = FTP_BURST_TIMEOUT_MS;
+
+    if (payload.burstComplete) {
+      burst.finish('complete');
+      return;
+    }
+    this.armBurstTimer();
   }
 
   // ─── Low-level Protocol ──────────────────────────────────────────────────
@@ -825,29 +1080,7 @@ export class MavlinkFtpClient {
     offset: number;
     data: Uint8Array;
   }): Promise<FtpPayload | null> {
-    return new Promise<FtpPayload | null>((resolve) => {
-      this.clearPending();
-
-      this.pendingResolve = resolve;
-
-      this.pendingTimer = setTimeout(() => {
-        this.pendingTimer = null;
-        const r = this.pendingResolve;
-        this.pendingResolve = null;
-        r?.(null);
-      }, FTP_TIMEOUT_MS);
-
-      const payload = this.buildPayload(fields);
-      this.sendPacket(payload).catch(() => {
-        if (this.pendingTimer) {
-          clearTimeout(this.pendingTimer);
-          this.pendingTimer = null;
-        }
-        const r = this.pendingResolve;
-        this.pendingResolve = null;
-        r?.(null);
-      });
-    });
+    return this.sendRequestWithTimeout(fields, FTP_TIMEOUT_MS);
   }
 
   private buildPayload(fields: {
@@ -858,6 +1091,7 @@ export class MavlinkFtpClient {
     data: Uint8Array;
   }): Uint8Array {
     this.seqNumber = (this.seqNumber + 1) & 0xffff;
+    this.pendingSeq = this.seqNumber;
 
     return serializeFtpPayload({
       seqNumber: this.seqNumber,
@@ -878,6 +1112,7 @@ export class MavlinkFtpClient {
       clearTimeout(this.pendingTimer);
       this.pendingTimer = null;
     }
+    this.pendingSeq = null;
     if (this.pendingResolve) {
       this.pendingResolve(null);
       this.pendingResolve = null;

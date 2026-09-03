@@ -66,6 +66,16 @@ fn default_voltage() -> f64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SectionSpec {
+    /// A section by SHAPE. `naca` is a 4-digit designation ("0012", "2412");
+    /// `reynolds` the chord Reynolds number to solve it at, which matters:
+    /// stall angle and drag both move with it, and a 2 m model glider flies at
+    /// a few hundred thousand where a light aircraft flies at a few million.
+    ///
+    /// The polar is SOLVED from these coordinates by `panel` and `bl`, so
+    /// camber, thickness, leading-edge radius, stall angle and drag all come
+    /// from the shape. This is the route a wing should use; the two below exist
+    /// for measured data and for describing a section that has no shape.
+    Naca { naca: String, #[serde(default)] reynolds: Option<f64> },
     /// `(alpha_deg, cl, cd, cm)` samples, sorted ascending. The path an AVL,
     /// XFOIL or wind-tunnel polar takes, and where a validated airframe should
     /// end up: it replaces the parametric guess with measurement.
@@ -132,6 +142,10 @@ pub struct WingSpec {
     /// Root quarter-chord position relative to the CG, body FRD (m).
     pub root: [f64; 3],
     /// Semi-span of ONE panel (m), root to tip.
+    ///
+    /// NEGATIVE on a `vertical` panel means it hangs DOWNWARD from its root,
+    /// which is where a paper dart's keel and many a model's ventral fin
+    /// actually are. The magnitude sets the area either way.
     pub semi_span: f64,
     pub chord_root: f64,
     pub chord_tip: f64,
@@ -328,6 +342,13 @@ pub struct Airframe {
     pub pwm: PwmSpec,
     pub area_cd: Vec3,
     pub airfoils: Vec<AirfoilTable>,
+    /// The SHAPE behind each airfoil table, when it came from one. Kept so a
+    /// renderer can draw the section the physics is actually flying rather than
+    /// a flat plate standing in for it: the sheet articles are a NACA 0004 and
+    /// a 0018, and drawing both as the same zero-thickness quad hides the only
+    /// difference between them. `None` where a section was given as bare
+    /// coefficients or a raw polar and has no shape to draw.
+    pub sections: Vec<Option<crate::panel::Section>>,
     pub surfaces: Vec<Surface>,
     pub rotors: Vec<Rotor>,
     pub rotor_channels: Vec<RotorChannels>,
@@ -364,6 +385,31 @@ impl std::fmt::Display for BuildError {
 impl std::error::Error for BuildError {}
 
 impl AirframeSpec {
+    /// The SHAPE of the first non-vertical wing's section, when it has one.
+    ///
+    /// For drawing. A section given as a parametric guess or a raw polar has no
+    /// shape to return, and returning `None` for those is the honest answer:
+    /// only a wing that names geometry has geometry to show.
+    pub fn first_wing_section(&self) -> Option<(crate::panel::Section, f64, f64, f64)> {
+        let w = self.wings.iter().find(|w| !w.vertical)?;
+        let sec = match self.airfoils.get(&w.airfoil)? {
+            SectionSpec::Naca { naca, .. } => {
+                let d: Vec<u32> = naca.chars().filter_map(|c| c.to_digit(10)).collect();
+                if d.len() < 4 {
+                    return None;
+                }
+                crate::panel::Section::naca4(
+                    d[0] as f64,
+                    d[1] as f64,
+                    (d[2] * 10 + d[3]) as f64,
+                    160,
+                )
+            }
+            _ => return None,
+        };
+        Some((sec, w.chord_root, w.root[0], w.root[2]))
+    }
+
     pub fn from_json(s: &str) -> Result<AirframeSpec, serde_json::Error> {
         serde_json::from_str(s)
     }
@@ -395,8 +441,10 @@ impl AirframeSpec {
         let index: HashMap<&str, usize> =
             names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
         let mut airfoils = Vec::with_capacity(names.len());
+        let mut sections: Vec<Option<crate::panel::Section>> = Vec::with_capacity(names.len());
         for n in &names {
             airfoils.push(build_table(&self.airfoils[*n], 6.0));
+            sections.push(shape_of(&self.airfoils[*n]));
         }
         let lookup = |n: &str| -> Result<usize, BuildError> {
             index.get(n).copied().ok_or_else(|| BuildError::UnknownAirfoil(n.to_string()))
@@ -420,6 +468,7 @@ impl AirframeSpec {
             let corrected = correct_for_wing(&self.airfoils[&w.airfoil], ar, w.oswald);
             let table_index = airfoils.len();
             airfoils.push(corrected);
+            sections.push(shape_of(&self.airfoils[&w.airfoil]));
             let _ = base;
 
             let is_reference = !w.vertical && !reference_taken;
@@ -484,6 +533,7 @@ impl AirframeSpec {
             pwm: self.pwm,
             area_cd: Vec3::new(f.area_cd[0], f.area_cd[1], f.area_cd[2]),
             airfoils,
+            sections,
             surfaces,
             rotors,
             rotor_channels,
@@ -493,17 +543,104 @@ impl AirframeSpec {
     }
 }
 
+/// The coordinates behind a section spec, when it has any.
+fn shape_of(s: &SectionSpec) -> Option<crate::panel::Section> {
+    match s {
+        SectionSpec::Naca { naca, .. } => {
+            let d: Vec<u32> = naca.chars().filter_map(|c| c.to_digit(10)).collect();
+            if d.len() < 4 {
+                return None;
+            }
+            Some(crate::panel::Section::naca4(
+                d[0] as f64,
+                d[1] as f64,
+                (d[2] * 10 + d[3]) as f64,
+                80,
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn wing_aspect_ratio(w: &WingSpec) -> f64 {
     let mean_chord = 0.5 * (w.chord_root + w.chord_tip);
     if mean_chord <= 0.0 {
         return 1.0;
     }
-    let span = if w.mirror { 2.0 * w.semi_span } else { w.semi_span };
+    let span = if w.mirror { 2.0 * w.semi_span.abs() } else { w.semi_span.abs() };
     (span / mean_chord).max(0.1)
+}
+
+/// Reynolds number assumed when a section does not give one. A 200 mm chord at
+/// 20 m/s, which is a model aeroplane.
+const DEFAULT_RE: f64 = 2.7e5;
+
+/// Solve a NACA section into a polar and correct it to a finite wing.
+///
+/// The panel and boundary-layer solve is TWO-DIMENSIONAL. Lifting-line theory
+/// turns that into a wing: at a given lift the 3D wing needs more incidence by
+/// `CL/(pi e AR)`, and carries induced drag of `CL^2/(pi e AR)`. Applying it to
+/// the samples rather than to a slope means it stays correct through the stall,
+/// where there is no slope to correct.
+fn solve_naca(code: &str, re: f64, ar: f64, e: f64) -> AirfoilTable {
+    let digits: Vec<u32> = code.chars().filter_map(|c| c.to_digit(10)).collect();
+    let sec = if digits.len() >= 4 {
+        crate::panel::Section::naca4(
+            digits[0] as f64,
+            digits[1] as f64,
+            (digits[2] * 10 + digits[3]) as f64,
+            200,
+        )
+    } else {
+        crate::panel::Section::naca4(0.0, 0.0, 12.0, 200)
+    };
+    let two_d = crate::bl::polar(&sec, re, -22.0, 22.0, 0.5);
+    if two_d.len() < 3 {
+        return AirfoilTable::from_polar(&two_d, ar);
+    }
+
+    // Truncate to the ATTACHED range before correcting, because lifting-line
+    // theory is only defined there and applying it past the stall breaks the
+    // table outright.
+    //
+    // The correction shifts each sample to `alpha + CL/(pi e AR)`. Past the
+    // stall CL FALLS, so the shifted angle runs backwards and the samples stop
+    // being sorted, which the interpolator assumes they are. On an aspect-ratio
+    // 1 sheet that put a hole at 10 degrees where lift vanished and drag jumped
+    // fiftyfold to 1.0, and an article flying through it lost its speed for no
+    // visible reason. Past the peak is Viterna's job anyway.
+    let i_pos = two_d
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.0 > 0.0)
+        .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+        .map(|(i, _)| i)
+        .unwrap_or(two_d.len() - 1);
+    let i_neg = two_d
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.0 < 0.0)
+        .min_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let (lo, hi) = (i_neg.min(i_pos), i_neg.max(i_pos));
+
+    let k = if ar > 0.0 { 1.0 / (PI * e * ar) } else { 0.0 };
+    let mut three_d: Vec<(f64, f64, f64, f64)> = two_d[lo..=hi]
+        .iter()
+        .map(|&(a, cl, cd, cm)| (a + cl * k, cl, cd + cl * cl * k, cm))
+        .collect();
+    // Belt and braces: drop anything that still fails to advance, so the
+    // interpolator can never be handed an unsorted list again.
+    three_d.dedup_by(|b, a| b.0 <= a.0);
+    AirfoilTable::from_polar(&three_d, ar)
 }
 
 fn build_table(s: &SectionSpec, ar: f64) -> AirfoilTable {
     match s {
+        SectionSpec::Naca { naca, reynolds } => {
+            solve_naca(naca, reynolds.unwrap_or(DEFAULT_RE), ar, 0.85)
+        }
         SectionSpec::Polar { polar } => {
             let samples: Vec<(f64, f64, f64, f64)> = polar
                 .iter()
@@ -532,6 +669,9 @@ fn build_table(s: &SectionSpec, ar: f64) -> AirfoilTable {
 /// parametric guess.
 fn correct_for_wing(s: &SectionSpec, ar: f64, e: f64) -> AirfoilTable {
     match s {
+        SectionSpec::Naca { naca, reynolds } => {
+            solve_naca(naca, reynolds.unwrap_or(DEFAULT_RE), ar, e)
+        }
         SectionSpec::Polar { .. } => build_table(s, ar),
         SectionSpec::Parametric(p) => AirfoilTable::from_spec(&AirfoilSpec {
             cl_alpha: finite_wing_slope(p.cl_alpha, ar, e),
@@ -554,6 +694,11 @@ fn build_panel(
     channel_limits: &mut Vec<f64>,
 ) -> (Vec<Surface>, f64) {
     let n = w.strips.max(1);
+    // A vertical panel may hang downward (negative semi_span); the sign steers
+    // it, the magnitude is the area. Taking the raw value as a width would give
+    // a downward fin negative area and therefore negative lift.
+    let span_len = w.semi_span.abs();
+    let span_sign = if w.semi_span < 0.0 { -1.0 } else { 1.0 };
     // The root offset MIRRORS with the panel. Applying it with the same sign to
     // both sides puts the whole wing off centre, which shows up as a slow roll
     // with no asymmetry anywhere a reader would think to look.
@@ -567,7 +712,7 @@ fn build_panel(
         // Mid-strip station as a fraction of the semi-span.
         let t = (i as f64 + 0.5) / n as f64;
         let chord = w.chord_root + (w.chord_tip - w.chord_root) * t;
-        let width = w.semi_span / n as f64;
+        let width = span_len / n as f64;
         let a = chord * width;
         area += a;
 
@@ -578,9 +723,11 @@ fn build_panel(
         // every force it produces still looks correct in isolation. Twin fins
         // still get their root offset mirrored, so both march up from their own
         // boom.
-        let y = w.semi_span * t;
+        let y = span_len * t;
         let pos = if w.vertical {
-            Vec3::new(root.x - y * sweep.tan(), root.y, root.z - y)
+            // Body z is DOWN, so subtracting rises. `span_sign` flips it for a
+            // VENTRAL fin, which is where a paper dart's keel actually is.
+            Vec3::new(root.x - y * sweep.tan(), root.y, root.z - y * span_sign)
         } else {
             Vec3::new(
                 root.x - y * sweep.tan(),

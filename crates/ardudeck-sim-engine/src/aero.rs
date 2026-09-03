@@ -24,6 +24,55 @@ use std::f64::consts::PI;
 /// data justifies; the cost is 361 entries per airfoil and the benefit is that
 /// linear interpolation never has to cross the stall peak in one step.
 pub const TABLE_STEP_DEG: f64 = 1.0;
+
+/// Panels along the chord of every strip.
+///
+/// Five is enough to resolve the linear variation of local flow that rotation
+/// produces, which is the whole reason the chord is resolved at all. It costs
+/// five table lookups per strip instead of one, and the strip sum was measured
+/// at 0.20 ms against a 128 ms frame, so there is room.
+pub const CHORD_PANELS: usize = 5;
+
+/// Chordwise loading weights: what fraction of a section's force each panel
+/// carries.
+///
+/// NOT uniform. Thin-airfoil theory gives the loading on a flat plate at
+/// incidence as `cot(theta/2)` with `x/c = (1 - cos theta)/2`, which piles the
+/// load onto the leading edge and puts the resultant at the QUARTER chord.
+/// Spreading it evenly instead puts the resultant at mid-chord, which moves the
+/// aerodynamic centre a quarter of a chord aft and changes the pitch stability
+/// of everything: it turned the foam sheet from unstable into stable, so it
+/// stopped tumbling and fell edge-on at ten metres a second against a terminal
+/// velocity of 1.8.
+pub fn chord_loading() -> [(f64, f64); CHORD_PANELS] {
+    // Integrated EXACTLY over each panel, not sampled at its midpoint. With
+    // `x/c = (1 - cos t)/2` the load `cot(t/2)` integrates to `t + sin t`, and
+    // its first moment to `t/2 - sin(2t)/4`. Midpoint sampling put the resultant
+    // at 0.309 c instead of 0.25, because `cot(t/2)` is singular at the leading
+    // edge and a midpoint cannot see it.
+    let mut out = [(0.0, 0.0); CHORD_PANELS];
+    let theta = |t: f64| (1.0 - 2.0 * t).clamp(-1.0, 1.0).acos();
+    let load = |t: f64| t + t.sin();
+    let moment = |t: f64| 0.5 * (t * 0.5 - (2.0 * t).sin() * 0.25);
+    let mut total = 0.0;
+    for (j, o) in out.iter_mut().enumerate() {
+        let (ta, tb) = (
+            theta(j as f64 / CHORD_PANELS as f64),
+            theta((j as f64 + 1.0) / CHORD_PANELS as f64),
+        );
+        let w = load(tb) - load(ta);
+        // Load centroid of this panel, as a fraction of chord from the LE.
+        let x = if w.abs() > 1e-12 { (moment(tb) - moment(ta)) / w } else { 0.5 };
+        *o = (w, x);
+        total += w;
+    }
+    for o in out.iter_mut() {
+        o.0 /= total;
+    }
+    out
+}
+
+/// Table entries over the full -180..180 circle at `TABLE_STEP_DEG`.
 const TABLE_N: usize = 361;
 
 /// Aspect ratio above which the Viterna CD_max correlation saturates. Viterna &
@@ -181,6 +230,63 @@ impl AirfoilTable {
         AirfoilTable { cl, cd, cm }
     }
 
+    /// Build from a COMPUTED polar: measured or solved data inside its valid
+    /// range, Viterna beyond it.
+    ///
+    /// A panel-plus-boundary-layer solve is only meaningful up to stall and a
+    /// little past; it knows nothing about a section broadside to the flow. So
+    /// the computed data is used where it is valid, anchored at its own stall
+    /// points, and Viterna carries it the rest of the way round. That is the
+    /// same division `from_spec` makes, except the anchors are now solved for
+    /// rather than typed in.
+    pub fn from_polar(samples: &[(f64, f64, f64, f64)], aspect_ratio: f64) -> AirfoilTable {
+        if samples.len() < 3 {
+            return AirfoilTable::from_samples(samples);
+        }
+        let ar = aspect_ratio.clamp(0.1, VITERNA_AR_MAX);
+        let cd_max = 1.11 + 0.018 * ar;
+        // Stall is where the computed lift peaks, in each direction.
+        let pos = samples
+            .iter()
+            .filter(|s| s.0 > 0.0)
+            .fold(samples[0], |a, b| if b.1 > a.1 { *b } else { a });
+        let neg = samples
+            .iter()
+            .filter(|s| s.0 < 0.0)
+            .fold(samples[0], |a, b| if b.1 < a.1 { *b } else { a });
+        let rev_cd =
+            REVERSED_CD_FACTOR * 0.5 * (cd_min_of(pos.2, cd_max) + cd_min_of(neg.2, cd_max));
+        let cm_ref = samples
+            .iter()
+            .min_by(|a, b| a.0.abs().total_cmp(&b.0.abs()))
+            .map(|s| s.3)
+            .unwrap_or(0.0);
+
+        let mut cl = Vec::with_capacity(TABLE_N);
+        let mut cd = Vec::with_capacity(TABLE_N);
+        let mut cm = Vec::with_capacity(TABLE_N);
+        for i in 0..TABLE_N {
+            let a = (-180.0 + TABLE_STEP_DEG * i as f64).to_radians();
+            let c = if a <= pos.0 && a >= neg.0 {
+                let (l, d, m) = interp_samples(samples, a);
+                // Bounded by the flat plate here too, not only past the stall.
+                // A computed polar carries induced drag, and on an aspect-ratio
+                // 1 wing that is `CL^2 / (pi e AR)` = 1.5 at CL 2, which is
+                // above the plate value the extrapolated branch is held to. The
+                // two then disagreed by 0.27 at the join. Nothing out-drags a
+                // flat plate, computed or extrapolated.
+                Coeffs { cl: l, cd: d.min(cd_max), cm: m }
+            } else {
+                let anchor = if a >= 0.0 { pos } else { neg };
+                post_stall(a, cd_max, anchor.0.abs(), anchor.1.abs(), anchor.2, cm_ref, rev_cd)
+            };
+            cl.push(c.cl);
+            cd.push(c.cd);
+            cm.push(c.cm);
+        }
+        AirfoilTable { cl, cd, cm }
+    }
+
     /// Linear interpolation at an arbitrary angle. `alpha` is wrapped into
     /// -pi..pi first, so a tumbling airframe never indexes off the end.
     pub fn at(&self, alpha: f64) -> Coeffs {
@@ -224,18 +330,23 @@ fn section_coeffs(
         return Coeffs { cl, cd, cm: s.cm_0 };
     }
 
-    // Post-stall. Viterna is derived for the first quadrant, so fold the angle
+    let m = if a >= 0.0 { pos } else { neg };
+    let rev = REVERSED_CD_FACTOR * 0.5 * (cd_min_of(pos.2, cd_max) + cd_min_of(neg.2, cd_max));
+    post_stall(a, cd_max, m.0.abs(), m.1.abs(), m.2, s.cm_0, rev)
+}
+
+/// The Viterna branch, shared by the parametric and the computed table builders.
+/// `a_s`, `cl_s`, `cd_s` are the stall anchor; `cm_0` the attached-flow moment.
+fn post_stall(a: f64, cd_max: f64, a_s: f64, cl_s: f64, cd_s: f64, cm_0: f64, rev_cd: f64) -> Coeffs {
+    // Viterna is derived for the first quadrant, so fold the angle
     // into 0..90 and restore the sign afterwards. Reflecting about 90 deg (a
     // reversed-flow section) rather than deriving a separate model is what
     // AeroDyn does, and it is why the curve stays continuous at 90 and 180.
     let sign = if a >= 0.0 { 1.0 } else { -1.0 };
-    let match_point = if a >= 0.0 { pos } else { neg };
     let mag = a.abs();
     // Reflected angle: past 90 deg the section is flying backwards, and the
     // magnitude that matters is the angle from the REVERSED chord.
     let (folded, reversed) = if mag <= PI / 2.0 { (mag, false) } else { (PI - mag, true) };
-
-    let (a_s, cl_s, cd_s) = (match_point.0.abs(), match_point.1.abs(), match_point.2);
 
     // Viterna carries a 1/sin(alpha) term, so it diverges as the folded angle
     // approaches zero, which is |alpha| -> 180: fully reversed flow. That region
@@ -244,11 +355,26 @@ fn section_coeffs(
     // interpolate between the Viterna value at the match point and the physical
     // values at exactly 180 (no lift, and the drag of a trailing-edge-first
     // section). Anchoring both ends keeps the full circle continuous.
+    // The anchor's drag is clamped into the flat-plate envelope first.
+    //
+    // Viterna solves for `b2` from the anchor, and a CL-peak taken off a
+    // computed polar already carries post-stall separation drag. Fed in raw,
+    // `b2` comes out large and `cd = b1 sin^2 + b2 cos` overshoots badly away
+    // from the anchor: the 18% sheet reached CD 2.75 and CL 2.7 near -80
+    // degrees, against a flat-plate maximum near 1.13. That is a force
+    // coefficient of 3.9 on a plate, and it threw a 20 g article upward at five
+    // times its own weight.
+    let cd_s = cd_s.min(cd_max);
+
     let (cl_v, cd_v) = if reversed && folded < a_s {
         let (cl_s_v, cd_s_v) = viterna(a_s, a_s, cl_s, cd_s, cd_max);
         // A reversed section is draggy even when attached; 2x the forward
         // minimum is the usual order for a blunt trailing edge leading.
-        let cd_180 = cd_s.min(cd_max) * 0.0 + REVERSED_CD_FACTOR * cd_min_of(cd_s, cd_max);
+        // ONE value for both sides. At 180 degrees the flow is reversed over
+        // the same shape, so there is only one answer; anchoring each side on
+        // its own stall point gave the table two, and a symmetric section read
+        // cd 0.011 approaching from below and 0.185 from above.
+        let cd_180 = rev_cd;
         let f = (folded / a_s.max(1e-6)).clamp(0.0, 1.0);
         (cl_s_v * f, cd_180 + (cd_s_v - cd_180) * f)
     } else {
@@ -267,7 +393,21 @@ fn section_coeffs(
     // -0.25 * CN is the flat-plate limit (CP at c/2, a quarter chord aft).
     let cn = cl * folded.cos() + cd * folded.sin();
     let blend = ((mag - a_s) / (PI / 2.0 - a_s).max(1e-6)).clamp(0.0, 1.0);
-    let cm = s.cm_0 * (1.0 - blend) - 0.25 * cn * blend;
+    let cm = cm_0 * (1.0 - blend) - 0.25 * cn * blend;
+
+    // Bounded by the flat-plate envelope. Past the stall a section IS a bluff
+    // plate, and nothing there can out-drag one broadside or out-lift Viterna's
+    // own `cd_max/2` amplitude on the sin(2a) term. This is a physical bound,
+    // not a safety clamp, and it is the one that would have caught the anchor
+    // problem above the moment it appeared.
+    let cd = cd.clamp(0.0, cd_max);
+    // Bounded by the flat plate OR by the anchor itself, whichever is larger.
+    // A clamp tighter than the anchor puts a step at the join: the attached
+    // polar legitimately reaches |CL| 1.5 on a low-aspect-ratio sheet while the
+    // flat-plate value is 1.13, and clamping to the latter made lift jump 0.29
+    // in a quarter of a degree.
+    let cl_bound = cd_max.max(cl_s);
+    let cl = cl.clamp(-cl_bound, cl_bound);
 
     Coeffs { cl, cd, cm }
 }
@@ -360,6 +500,63 @@ pub fn flap_effectiveness(chord_fraction: f64) -> f64 {
     1.0 - (theta - theta.sin()) / PI
 }
 
+// ─── Unsteady terms ─────────────────────────────────────────────────────────
+
+/// Added mass of the airframe, body frame, as a diagonal tensor plus the
+/// rotational part. Both in SI: kg and kg m^2.
+///
+/// A body accelerating through air drags air with it, and for a thin plate that
+/// fluid is not a correction: this project's 300 mm foam sheet weighs 20 g and
+/// carries 26 g of added mass, so more than half the inertia resisting its
+/// motion is air. Leaving it out makes a light plate respond far too eagerly to
+/// every force on it, which is why the sheet fluttered where a real one tumbles.
+///
+/// Strip by strip: a plate has added mass `rho pi c^2 / 4` per unit span NORMAL
+/// to itself and essentially none edgewise, so each strip contributes along its
+/// own normal and the total is anisotropic in body axes. That anisotropy is the
+/// physically important part and a single scalar would throw it away.
+///
+/// This is NOT the Munk moment, which the strip sum already carries by applying
+/// each force at the quarter chord. This is the inertia.
+pub fn added_mass(surfaces: &[Surface], rho: f64) -> (Vec3, Vec3) {
+    let mut m = Vec3::zero();
+    let mut i = Vec3::zero();
+    for s in surfaces {
+        let width = s.area / s.chord.max(1e-6);
+        // Normal-direction added mass of this strip.
+        let ma = rho * PI * s.chord * s.chord / 4.0 * width;
+        let n = s.normal;
+        // Projected onto the body axes: a strip resists acceleration along its
+        // own normal and hardly at all in its own plane.
+        m = m.add(Vec3::new(ma * n.x * n.x, ma * n.y * n.y, ma * n.z * n.z));
+        // Added inertia: the strip's own added moment about its span
+        // (rho pi c^4 / 128 per unit span) plus its added mass on its arm.
+        let own = rho * PI * s.chord.powi(4) / 128.0 * width;
+        let r = s.position;
+        i = i.add(Vec3::new(
+            ma * (r.y * r.y + r.z * r.z),
+            ma * (r.z * r.z + r.x * r.x),
+            ma * (r.x * r.x + r.y * r.y),
+        ));
+        let span = s.forward.cross(s.normal).normalize();
+        i = i.add(Vec3::new(
+            own * span.x * span.x,
+            own * span.y * span.y,
+            own * span.z * span.z,
+        ));
+    }
+    (m, i)
+}
+
+/// Andersen, Pesavento and Wang (JFM 541, 2005) measured falling plates and
+/// found that for BOTH fluttering and tumbling the circulation is dominated by
+/// a ROTATIONAL term proportional to the plate's angular velocity, rather than
+/// by the translational one that carries a glider at fixed incidence.
+///
+/// That term is not written out anywhere in this file, because it does not need
+/// to be: evaluating the local flow at the three-quarter chord produces it, and
+/// produces it at every angle rather than only near zero.
+
 // ─── Surfaces ───────────────────────────────────────────────────────────────
 
 /// One strip of lifting surface, in body frame.
@@ -437,11 +634,34 @@ impl Surface {
 #[derive(Debug, Clone, Copy)]
 pub struct SurfaceDiag {
     pub alpha: f64,
+    /// The flow this strip actually saw, body frame (m/s): aircraft motion plus
+    /// its own velocity from the body rates, minus whatever was induced on it.
+    ///
+    /// Computed and then discarded until now. It is the single most useful thing
+    /// to draw when asking whether the model is doing something sensible,
+    /// because it is the INPUT to every coefficient lookup: if the flow at a
+    /// strip is wrong, everything downstream of it is wrong too, and no amount
+    /// of staring at the resulting force will say so.
+    pub flow_bf: Vec3,
     /// Dynamic pressure at the strip (Pa), after slipstream.
     pub q: f64,
     pub cl: f64,
     pub cd: f64,
     pub force_bf: Vec3,
+    /// Where the force actually acts, as a fraction of chord AFT of the quarter
+    /// chord. 0 is the quarter chord, 0.25 is mid-chord.
+    ///
+    /// The quarter chord is only where the force is BOOKED; the pitching moment
+    /// carries the rest of the story, and on a flat plate at 90 degrees the
+    /// centre of pressure is at mid-chord. Reporting it makes that visible
+    /// instead of leaving it implicit in a moment coefficient, and an arrow
+    /// drawn here moves aft as the strip stalls, which is a checkable
+    /// prediction rather than a convention.
+    ///
+    /// From `CM = -CN * (d/c)`: the moment about the quarter chord is what the
+    /// normal force acting `d` aft of it produces. Undefined when the normal
+    /// force vanishes, so it is clamped into the chord.
+    pub cp_aft_frac: f64,
     /// True once the strip is past its table's linear region.
     pub stalled: bool,
 }
@@ -506,10 +726,10 @@ pub fn surface_forces(
     let mut area_stalled = 0.0;
 
     for (si, s) in surfaces.iter().enumerate() {
-        // Local flow: vehicle motion, the strip's own velocity from body rates,
-        // and whatever the caller induces there. The rotation term is why a strip
-        // model damps in roll and pitch without a separate damping derivative.
-        let v_rot = flow.gyro.cross(s.position);
+        let span = s.span_axis();
+        let (fwd, nrm) = rotate_about(s.forward, s.normal, span, s.incidence);
+        let width = s.area / s.chord.max(1e-6);
+
         let v_ind = if s.wash_fraction > 0.0 {
             let raw = match flow.induced_per_surface {
                 Some(per) => per.get(si).copied().unwrap_or_else(|| (flow.induced)(s.position)),
@@ -519,76 +739,109 @@ pub fn surface_forces(
         } else {
             Vec3::zero()
         };
-        // `induced` is the air's velocity relative to the airframe; the strip's
-        // velocity relative to the AIR is therefore minus that.
-        let v = flow.velocity_air_bf.add(v_rot).sub(v_ind);
-
-        // Rig the section: incidence rotates the chord line about the span axis.
-        let span = s.span_axis();
-        let (fwd, nrm) = rotate_about(s.forward, s.normal, span, s.incidence);
-
-        let u = v.dot(fwd);
-        let w = -v.dot(nrm);
-        let v_plane_sq = u * u + w * w;
-        if v_plane_sq < 1e-9 {
-            diag.push(SurfaceDiag {
-                alpha: 0.0,
-                q: 0.0,
-                cl: 0.0,
-                cd: 0.0,
-                force_bf: Vec3::zero(),
-                stalled: false,
-            });
-            area_total += s.area;
-            continue;
-        }
-        // Strip theory: only the component in the section plane produces section
-        // forces. The spanwise component is dropped (independence principle).
-        let alpha = w.atan2(u);
-        let q = 0.5 * flow.air_density * v_plane_sq;
 
         let table = &airfoils[s.airfoil.min(airfoils.len().saturating_sub(1))];
-        let mut c = table.at(alpha);
-
-        // Control deflection as a zero-lift shift, evaluated by re-reading the
-        // table at the equivalent angle rather than by adding a delta-CL. Doing
-        // it at the table keeps the control effective in the linear region and
-        // correctly INEFFECTIVE once the strip has stalled, which is the whole
-        // reason to model post-stall at all.
         let mut deflect = 0.0;
+        let mut tau = 0.0;
         if let Some(link) = &s.control {
             let raw = controls.get(link.channel).copied().unwrap_or(0.0) * link.gain;
             deflect = raw.clamp(-link.max_deflect, link.max_deflect);
-            if deflect != 0.0 {
-                let tau = flap_effectiveness(link.chord_fraction);
-                c = table.at(alpha + tau * deflect);
-                // Hinge-gap and separation drag, quadratic in deflection. Small,
-                // but it is what makes a hard aileron input cost airspeed.
-                c.cd += 0.02 * deflect * deflect / link.chord_fraction.max(0.05);
-            }
+            tau = flap_effectiveness(link.chord_fraction);
         }
 
-        let l = q * s.area * c.cl;
-        let d = q * s.area * c.cd;
-        let m = q * s.area * s.chord * c.cm;
+        // ── CHORDWISE PANELS ───────────────────────────────────────────────
+        //
+        // The chord is resolved, not treated as a point. Each panel carries its
+        // share of the area and reads the flow at its OWN chordwise station, so
+        // when the section turns they see different angles and the resulting
+        // force and moment distribution falls out of the sum.
+        //
+        // This replaces two fitted constants. A single evaluation point cannot
+        // see that a section is rotating at all, so the rotation had to be
+        // reintroduced twice by hand: once as a three-quarter-chord offset for
+        // its effect on incidence, and once as a `|r|^3` drag coefficient for
+        // the damping. Both were calibrated, and the falling-plate behaviour was
+        // sensitive to both. Integrating over the chord gives both directly.
+        //
+        // At zero rotation every panel reads the same flow and the sum is
+        // identical to evaluating once, so nothing in ordinary flight moves.
+        let mut strip_force = Vec3::zero();
+        let mut strip_moment = Vec3::zero();
+        let mut alpha_ref = 0.0;
+        let mut q_ref = 0.0;
+        let (mut cl_ref, mut cd_ref, mut cp_ref) = (0.0, 0.0, 0.0);
+        let mut stalled = false;
+        let inv = 1.0 / CHORD_PANELS as f64;
+        let load = chord_loading();
 
-        // In-plane velocity direction, and lift normal to it.
-        let v_ip = fwd.scale(u).sub(nrm.scale(w));
-        let drag_dir = v_ip.normalize();
-        let lift_dir = span.cross(drag_dir).normalize();
+        for j in 0..CHORD_PANELS {
+            // Panel centre as a fraction of chord from the leading edge, and its
+            // offset from the quarter chord where the strip is pinned.
+            let (wj, t) = load[j];
+            let at = s.position.add(fwd.scale((0.25 - t) * s.chord));
+            let v_rot = flow.gyro.cross(at);
+            let v = flow.velocity_air_bf.add(v_rot).sub(v_ind);
 
-        let f = lift_dir.scale(l).sub(drag_dir.scale(d));
-        force = force.add(f);
-        moment = moment.add(span.scale(m)).add(s.position.cross(f));
+            let u = v.dot(fwd);
+            let w = -v.dot(nrm);
+            let v_plane_sq = u * u + w * w;
+            if v_plane_sq < 1e-9 {
+                continue;
+            }
+            let alpha = w.atan2(u);
+            let q = 0.5 * flow.air_density * v_plane_sq;
 
-        // "Stalled" is defined off the table, not off a fixed angle, so a section
-        // with a wide linear region is not reported as stalled early.
-        let stalled = is_stalled(table, alpha + deflect);
+            let mut c = table.at(alpha);
+            if deflect != 0.0 {
+                c = table.at(alpha + tau * deflect);
+                c.cd += 0.02 * deflect * deflect
+                    / s.control.map(|l| l.chord_fraction).unwrap_or(0.25).max(0.05);
+            }
+
+            let area = s.area * wj;
+            let l = q * area * c.cl;
+            let d = q * area * c.cd;
+            let m = q * area * s.chord * c.cm;
+
+            let v_ip = fwd.scale(u).sub(nrm.scale(w));
+            let drag_dir = v_ip.normalize();
+            let lift_dir = span.cross(drag_dir).normalize();
+            let f = lift_dir.scale(l).sub(drag_dir.scale(d));
+
+            strip_force = strip_force.add(f);
+            strip_moment = strip_moment.add(span.scale(m)).add(at.cross(f));
+
+            // The middle panel stands for the strip in the diagnostics, which
+            // are observability only.
+            if j == CHORD_PANELS / 2 {
+                alpha_ref = alpha;
+                q_ref = q;
+                cl_ref = c.cl;
+                cd_ref = c.cd;
+                let cn = c.cl * alpha.cos() + c.cd * alpha.sin();
+                cp_ref = if cn.abs() > 1e-6 { (-c.cm / cn).clamp(-0.25, 0.75) } else { 0.0 };
+                stalled = is_stalled(table, alpha + deflect);
+            }
+        }
+        let _ = width;
+
+        force = force.add(strip_force);
+        moment = moment.add(strip_moment);
+
         area_total += s.area;
         if stalled {
             area_stalled += s.area;
         }
-        diag.push(SurfaceDiag { alpha, q, cl: c.cl, cd: c.cd, force_bf: f, stalled });
+        diag.push(SurfaceDiag {
+            alpha: alpha_ref,
+            flow_bf: flow.velocity_air_bf.add(flow.gyro.cross(s.position)).sub(v_ind),
+            q: q_ref,
+            cl: cl_ref,
+            cd: cd_ref,
+            force_bf: strip_force,
+            cp_aft_frac: cp_ref,
+            stalled,
+        });
     }
 
     AeroOutput {
@@ -1001,6 +1254,31 @@ mod tests {
         assert!(cd_like > 0.9, "broadside drag coefficient only {cd_like}");
     }
 
+    /// The centre of pressure MOVES. Attached, it sits near the quarter chord;
+    /// broadside, a flat plate carries its load at mid-chord, a quarter chord
+    /// aft of where the force is booked. That migration is the whole reason a
+    /// plate is unstable in pitch about its own centre, and it was previously
+    /// implicit in a moment coefficient and invisible.
+    #[test]
+    fn the_centre_of_pressure_moves_aft_as_the_strip_stalls() {
+        let t = vec![AirfoilTable::from_spec(&sym())];
+        let s = one_wing();
+        let cp_at = |vz: f64| {
+            surface_forces(&s, &t, &[], &flow(Vec3::new(30.0, 0.0, vz))).diag[0].cp_aft_frac
+        };
+        // Attached: at or very near the quarter chord.
+        assert!(cp_at(1.0).abs() < 0.05, "attached cp at {:.3} c aft", cp_at(1.0));
+        // Broadside: mid-chord, a quarter chord aft.
+        let broadside = surface_forces(&s, &t, &[], &flow(Vec3::new(0.0, 0.0, 5.0))).diag[0];
+        assert!(
+            (broadside.cp_aft_frac - 0.25).abs() < 0.02,
+            "broadside cp at {:.3} c aft, expected 0.25",
+            broadside.cp_aft_frac
+        );
+        // Monotone in between, which is what makes the migration readable.
+        assert!(cp_at(30.0) > cp_at(8.0) && cp_at(8.0) > cp_at(1.0));
+    }
+
     #[test]
     fn stalled_area_fraction_reports_the_wing_state() {
         let t = vec![AirfoilTable::from_spec(&sym())];
@@ -1073,5 +1351,32 @@ mod tests {
         let t = AirfoilTable::from_spec(&sym());
         assert!((t.at(PI).cl - t.at(-PI).cl).abs() < 1e-9);
         assert!((t.at(PI).cd - t.at(-PI).cd).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod chord_tests {
+    use super::*;
+
+    /// The loading must put the resultant at the QUARTER chord, because that is
+    /// where thin-airfoil theory puts it and every stability property downstream
+    /// depends on it.
+    #[test]
+    fn the_chordwise_loading_centres_on_the_quarter_chord() {
+        let w = chord_loading();
+        let total: f64 = w.iter().map(|p| p.0).sum();
+        assert!((total - 1.0).abs() < 1e-12, "weights sum to {total}");
+        let centroid: f64 = w.iter().map(|(wj, x)| wj * x).sum();
+        assert!(
+            (centroid - 0.25).abs() < 1e-6,
+            "resultant at {centroid:.4} c, thin-airfoil theory says exactly 0.25"
+        );
+        // Front-loaded, which is the shape of it, and every panel sits inside
+        // its own span of the chord.
+        assert!(w[0].0 > w[CHORD_PANELS - 1].0 * 3.0, "loading is not concentrated at the LE: {w:?}");
+        for (j, (_, x)) in w.iter().enumerate() {
+            let (lo, hi) = (j as f64 / CHORD_PANELS as f64, (j as f64 + 1.0) / CHORD_PANELS as f64);
+            assert!(*x >= lo && *x <= hi, "panel {j} centroid {x:.3} outside [{lo:.2},{hi:.2}]");
+        }
     }
 }

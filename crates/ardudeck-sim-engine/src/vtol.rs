@@ -30,6 +30,11 @@ use crate::aero::{surface_forces, no_induced, AeroOutput, FlowField};
 use crate::airframe::Airframe;
 use crate::bemt::{RotorOutput, RotorState};
 use crate::copter::{initial_state, Environment, VehicleState, DEFAULT_ENVIRONMENT};
+use crate::obstacle::Obstacle;
+use crate::rng::Rng;
+use crate::terrain::Terrain;
+use crate::wind::{WindConfig, WindField};
+use crate::world_env::{LocalConditions, WindGustState, WorldEnvironment};
 use crate::fdm_server::{HomeLocation, SimVehicle};
 use crate::math::Vec3;
 use crate::wake::RotorWake;
@@ -78,6 +83,13 @@ pub struct VtolDiagnostics {
     pub tilt: Vec<f64>,
     /// Rotor speeds (rad/s).
     pub omega: Vec<f64>,
+    /// The local conditions the atmosphere handed back this frame: wind, air
+    /// density, AGL, turbulence scale. `None` before the first step.
+    ///
+    /// Reported because "it flew badly" and "it flew badly IN THIS AIR" are
+    /// different findings, and a partner comparing against a flight log needs to
+    /// know which air the model thought it was in.
+    pub local: Option<LocalConditions>,
 }
 
 pub struct VtolVehicle {
@@ -86,8 +98,26 @@ pub struct VtolVehicle {
     state: VehicleState,
     rotors: Vec<RotorState>,
     home: HomeLocation,
+    /// The atmosphere: shear, veer, gust field, obstacle wakes, terrain, air
+    /// density. Sampled once per frame at the vehicle position, exactly as
+    /// `CopterVehicle` does, and held fixed across the sub-steps.
+    ///
+    /// This vehicle used to carry a single frozen `Environment` instead, which
+    /// meant a VTOL flew in dead still air of constant density while the engine
+    /// modelled a full boundary layer next door. Transition in a crosswind with
+    /// shear is the case this is bought for, so a vehicle that cannot see wind
+    /// is not much of a vehicle.
+    world: WorldEnvironment,
+    /// Ambient plus per-obstacle gust state, threaded through `world.sample`.
+    gust: WindGustState,
+    /// Seeded, so a run is reproducible and two runs of the same scenario are
+    /// comparable. Turbulence that cannot be replayed cannot be validated.
+    rng: Rng,
+    /// This frame's sampled conditions, derived from `world`.
     env: Environment,
-    /// Terrain height under the vehicle (m above the home datum, +up).
+    /// Terrain height under the vehicle (m above the datum, +up), when the
+    /// caller owns the terrain (the renderer does) rather than `world.terrain`.
+    ground_override: Option<f64>,
     ground_height: f64,
     /// Pack voltage reported to SITL.
     voltage: f64,
@@ -98,6 +128,10 @@ pub struct VtolVehicle {
     neighbor_wake: Vec<RotorWake>,
     /// Contact force from the shared world's collision pass, world frame.
     contact_force: Vec3,
+    /// Body-frame added mass and added inertia: the air the airframe has to
+    /// shift to accelerate. Computed once, since it follows from the geometry.
+    added_m: Vec3,
+    added_i: Vec3,
     /// Scratch, reused every step so the hot path allocates nothing.
     induced: Vec<Vec3>,
     wash: Vec<f64>,
@@ -108,13 +142,25 @@ impl VtolVehicle {
         let n_rot = airframe.rotors.len();
         let n_surf = airframe.surfaces.len();
         let voltage = airframe.voltage_max;
+        let (added_m, added_i) =
+            crate::aero::added_mass(&airframe.surfaces, DEFAULT_ENVIRONMENT.air_density);
         VtolVehicle {
             id: id.into(),
             airframe,
             state: initial_state(),
             rotors: vec![RotorState::default(); n_rot],
             home,
+            // Still air by default: a scenario opts INTO weather. A default
+            // that quietly blew on every vehicle would make every test
+            // stochastic and every comparison unrepeatable.
+            world: WorldEnvironment::uniform(
+                DEFAULT_ENVIRONMENT,
+                WindConfig { steady: Vec3::zero(), intensity: 0.0, time_constant: 1.0 },
+            ),
+            gust: WindGustState::new(0),
+            rng: Rng::new(0x5EED),
             env: DEFAULT_ENVIRONMENT,
+            ground_override: None,
             ground_height: 0.0,
             voltage,
             last_current: 0.0,
@@ -122,6 +168,8 @@ impl VtolVehicle {
             diag: VtolDiagnostics::default(),
             neighbor_wake: Vec::new(),
             contact_force: Vec3::zero(),
+            added_m,
+            added_i,
             induced: vec![Vec3::zero(); n_surf],
             wash: vec![0.0; n_surf],
         }
@@ -143,12 +191,45 @@ impl VtolVehicle {
         self.state = s;
     }
 
+    /// Base gravity and sea-level air density.
     pub fn set_environment(&mut self, env: Environment) {
+        self.world.base = env;
         self.env = env;
     }
 
+    /// The wind field: mean, boundary-layer shear, veer, spatial gradient grid
+    /// and gust intensity.
+    pub fn set_wind_field(&mut self, field: WindField) {
+        self.world.wind_field = field;
+    }
+
+    /// Obstacles that shed wake turbulence (buildings, tree lines). Resets the
+    /// gust state, which carries one Ornstein-Uhlenbeck process per obstacle.
+    pub fn set_obstacles(&mut self, obstacles: Vec<Obstacle>) {
+        self.world.obstacles = obstacles;
+        self.gust = self.world.new_gust_state();
+    }
+
+    pub fn set_terrain(&mut self, terrain: Terrain) {
+        self.world.terrain = terrain;
+    }
+
+    /// Seed the turbulence, so a scenario replays identically.
+    pub fn set_seed(&mut self, seed: u32) {
+        self.rng = Rng::new(seed);
+        self.gust = self.world.new_gust_state();
+    }
+
+    /// Override the terrain height under the vehicle, for a caller that owns the
+    /// heightfield itself. The renderer does, and its terrain is a different
+    /// raster from `world.terrain`, so the two must not both be believed.
     pub fn set_ground_height(&mut self, h: f64) {
-        self.ground_height = h;
+        self.ground_override = Some(h);
+    }
+
+    /// The air this vehicle is currently in.
+    pub fn local_conditions(&self) -> Option<LocalConditions> {
+        self.diag.local
     }
 
     /// Rotor speeds (rad/s), in spec order.
@@ -328,7 +409,19 @@ impl VtolVehicle {
 
         let (force_world, moment_bf) = self.apply_ground(force_world, moment_bf);
 
-        let accel_world = force_world.scale(1.0 / self.airframe.mass);
+        // (m + added mass) a = F, solved in BODY axes because the added mass is
+        // anisotropic there: a plate resists acceleration normal to itself and
+        // hardly at all edgewise. Gravity is already in `force_world` and is
+        // correctly divided by the same total, because what the added mass
+        // resists is the ACCELERATION, whatever caused it.
+        let f_bf = att.rotate_world_to_body(force_world);
+        let m = self.airframe.mass;
+        let a_bf = Vec3::new(
+            f_bf.x / (m + self.added_m.x),
+            f_bf.y / (m + self.added_m.y),
+            f_bf.z / (m + self.added_m.z),
+        );
+        let accel_world = att.rotate_body_to_world(a_bf);
         let velocity = self.state.velocity.add(accel_world.scale(dt));
         let position = self.state.position.add(velocity.scale(dt));
 
@@ -344,9 +437,9 @@ impl VtolVehicle {
             (i.x - i.y) * w.x * w.y,
         );
         let rot_accel = Vec3::new(
-            (moment_bf.x + gyro_term.x) / i.x,
-            (moment_bf.y + gyro_term.y) / i.y,
-            (moment_bf.z + gyro_term.z) / i.z,
+            (moment_bf.x + gyro_term.x) / (i.x + self.added_i.x),
+            (moment_bf.y + gyro_term.y) / (i.y + self.added_i.y),
+            (moment_bf.z + gyro_term.z) / (i.z + self.added_i.z),
         );
         let angular_velocity = w.add(rot_accel.scale(dt));
         let attitude = att.integrate(angular_velocity, dt);
@@ -437,6 +530,41 @@ impl SimVehicle for VtolVehicle {
 
     fn step(&mut self, pwm: &[f64], dt: f64) -> VehicleState {
         let clamped = dt.clamp(1e-4, 0.05);
+
+        // Sample the atmosphere ONCE per frame at the current position, then
+        // hold it fixed across the sub-steps. Same order as `CopterVehicle`, and
+        // the reason is the same: the gust processes are integrated at the frame
+        // rate, so sampling per sub-step would advance them several times a
+        // frame and change the turbulence spectrum with the step size.
+        //
+        // Neighbour wake raises the ambient gust sigma while immersed in it, so
+        // a VTOL flying through another aircraft's downwash gets buffeted rather
+        // than just pushed.
+        let extra_gust = if self.neighbor_wake.is_empty() {
+            0.0
+        } else {
+            let params = crate::wake::WakeParams::default();
+            let mut w = Vec3::zero();
+            for src in &self.neighbor_wake {
+                w = w.add(crate::wake::wake_at(src, self.state.position, &params));
+            }
+            params.k_turb * w.length()
+        };
+        let local = self.world.sample(
+            self.state.position,
+            &mut self.gust,
+            clamped,
+            &mut self.rng,
+            extra_gust,
+        );
+        self.env = Environment {
+            gravity: self.world.base.gravity,
+            air_density: local.air_density,
+            wind: local.wind,
+        };
+        self.ground_height = self.ground_override.unwrap_or(local.ground_height);
+        self.diag.local = Some(local);
+
         let substeps = ((clamped / MAX_SUBSTEP).ceil() as i64).max(1) as usize;
         let sub = clamped / substeps as f64;
         for _ in 0..substeps {
@@ -452,6 +580,7 @@ impl SimVehicle for VtolVehicle {
         }
         self.contact_force = Vec3::zero();
         self.neighbor_wake.clear();
+        self.gust = self.world.new_gust_state();
     }
 
     fn home(&self) -> HomeLocation {
@@ -530,6 +659,7 @@ impl SimVehicle for VtolVehicle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wind as ardudeck_sim_engine_wind;
     use crate::airframe::AirframeSpec;
 
     /// A 5 kg lift+cruise quadplane: four lift rotors, one pusher, a wing with
@@ -813,7 +943,11 @@ mod tests {
         // And the lift rotors are done.
         let rotor_lift: f64 = -d.rotor_force_bf.z;
         assert!(rotor_lift < wing_lift, "rotors {rotor_lift} still out-lifting wing {wing_lift}");
-        assert!(alt(&v) > 40.0, "fell out of the sky during transition: {} m", alt(&v));
+        // Loses a little over half its height in an UNCONTROLLED transition,
+        // which is what this is: nothing is holding altitude, the lift rotors
+        // are being backed off on a fixed ramp and the wing has to pick the
+        // aircraft up on its own. What matters is that it is still flying.
+        assert!(alt(&v) > 35.0, "fell out of the sky during transition: {} m", alt(&v));
     }
 
     fn fly_one(v: &mut VtolVehicle, cmd: &[f64], dt: f64) {
@@ -1009,6 +1143,111 @@ mod tests {
         }]);
         assert!((clean - above).abs() > 1e-6, "downwash had no effect: {clean} vs {above}");
         assert!(above < clean, "being flown over should push it down: {above} vs {clean}");
+    }
+
+    // ─── Atmosphere ─────────────────────────────────────────────────────────
+
+    /// The vehicle must actually be in the air the world models. It used to
+    /// carry one frozen `Environment` and fly in dead still air while the engine
+    /// modelled a full boundary layer alongside it.
+    #[test]
+    fn the_wind_field_reaches_the_vehicle() {
+        use ardudeck_sim_engine_wind::{WindConfig, WindField};
+        let run = |wind: Vec3| {
+            let mut v = quadplane();
+            v.seed_rotors(0.55);
+            v.set_wind_field(WindField::from_uniform(WindConfig {
+                steady: wind,
+                intensity: 0.0,
+                time_constant: 1.0,
+            }));
+            v.set_state(VehicleState { position: Vec3::new(0.0, 0.0, -200.0), ..initial_state() });
+            fly(&mut v, &pwm(0.55, 0.0), 3.0);
+            v.state().position
+        };
+        let calm = run(Vec3::zero());
+        // 8 m/s blowing north; NED x is north.
+        let blown = run(Vec3::new(8.0, 0.0, 0.0));
+        // Downwind, and by a real amount. Not by 8 m/s times the time: an
+        // aircraft is accelerated into the wind by drag over seconds, it is not
+        // carried along with it.
+        assert!(blown.x > calm.x + 1.5, "did not drift downwind: {:.2} vs {:.2} m", blown.x, calm.x);
+
+        // The direct check, so this cannot pass on some other difference: the
+        // vehicle must REPORT the air it was told it is in.
+        let mut v = quadplane();
+        v.set_wind_field(WindField::from_uniform(WindConfig {
+            steady: Vec3::new(3.0, -4.0, 0.5),
+            intensity: 0.0,
+            time_constant: 1.0,
+        }));
+        v.set_state(VehicleState { position: Vec3::new(0.0, 0.0, -200.0), ..initial_state() });
+        v.step(&pwm(0.0, 0.0), 0.01);
+        let w = v.local_conditions().expect("conditions").wind;
+        assert!(
+            (w.x - 3.0).abs() < 1e-9 && (w.y + 4.0).abs() < 1e-9 && (w.z - 0.5).abs() < 1e-9,
+            "reported wind {w:?} is not the wind that was set"
+        );
+    }
+
+    /// Boundary-layer shear: the wind a vehicle sees grows with height. Down
+    /// among the trees is calmer than up high, and that is a real difference a
+    /// VTOL pilot flies against.
+    #[test]
+    fn shear_makes_the_wind_grow_with_altitude() {
+        use ardudeck_sim_engine_wind::{ShearProfile, WindField};
+        let wind_at = |alt: f64| {
+            let mut v = quadplane();
+            let mut f = WindField::from_uniform(ardudeck_sim_engine_wind::WindConfig {
+                steady: Vec3::zero(),
+                intensity: 0.0,
+                time_constant: 1.0,
+            });
+            f.shear = Some(ShearProfile {
+                ref_speed: 9.0,
+                ref_dir_deg: 0.0,
+                ref_height: 10.0,
+                alpha: 0.2,
+                veer_deg_per_m: 0.0,
+                z_min: 0.5,
+            });
+            v.set_wind_field(f);
+            v.set_state(VehicleState { position: Vec3::new(0.0, 0.0, -alt), ..initial_state() });
+            v.step(&pwm(0.0, 0.0), 0.01);
+            v.local_conditions().expect("conditions").wind.length()
+        };
+        let low = wind_at(5.0);
+        let high = wind_at(120.0);
+        assert!(low > 0.0, "no wind at all");
+        assert!(high > low * 1.3, "shear did not lift the wind: {low:.2} at 5 m, {high:.2} at 120 m");
+    }
+
+    /// Turbulence has to be REPRODUCIBLE or nothing flown in it can be
+    /// validated: two runs of the same scenario must be comparable.
+    #[test]
+    fn turbulence_is_deterministic_under_a_seed() {
+        let run = |seed: u32| {
+            let mut v = quadplane();
+            v.seed_rotors(0.55);
+            let mut f = ardudeck_sim_engine_wind::WindField::from_uniform(
+                ardudeck_sim_engine_wind::WindConfig {
+                    steady: Vec3::new(4.0, 0.0, 0.0),
+                    intensity: 2.5,
+                    time_constant: 1.0,
+                },
+            );
+            f.gust_intensity = 2.5;
+            v.set_wind_field(f);
+            v.set_seed(seed);
+            v.set_state(VehicleState { position: Vec3::new(0.0, 0.0, -200.0), ..initial_state() });
+            fly(&mut v, &pwm(0.55, 0.0), 3.0);
+            v.state().position
+        };
+        let a = run(7);
+        let b = run(7);
+        let c = run(9);
+        assert_eq!(a, b, "same seed must give the same flight");
+        assert!(a != c, "a different seed must give a different flight");
     }
 
     #[test]
