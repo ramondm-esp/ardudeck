@@ -39,9 +39,21 @@ function saveFavourites(favourites: Set<string>) {
   } catch { /* ignore write errors */ }
 }
 
+/**
+ * Whether a FULL parameter set has been pulled from the vehicle.
+ *
+ * `paramCount > 0` does not answer this: connect-time batch reads (safety
+ * monitor IMAX/trim, Q_ENABLE, calibration tracking) land real PARAM_VALUEs in
+ * the store, so a handful of parameters can be present with no download having
+ * run. Guarding a fetch on the count then skips it forever and leaves the PID
+ * tab staring at six unrelated parameters.
+ */
+export type ParamDownloadState = 'idle' | 'loading' | 'complete' | 'failed';
+
 interface ParameterStore {
   // State
   parameters: Map<string, ParameterWithMeta>;
+  downloadState: ParamDownloadState;
   metadata: ParameterMetadataStore | null;
   isLoading: boolean;
   isLoadingMetadata: boolean;
@@ -86,6 +98,10 @@ interface ParameterStore {
 
   // Computed
   paramCount: number;
+  /** True only once a full download has landed, not merely some parameters. */
+  hasFullParameterSet: () => boolean;
+  /** True when an automatic fetch should start: nothing loaded and none running. */
+  needsParameterFetch: () => boolean;
   filteredParameters: () => ParameterWithMeta[];
   modifiedCount: () => number;
   modifiedParameters: () => ParameterWithMeta[];
@@ -182,6 +198,7 @@ const stagedParams = new Set<string>();
 export const useParameterStore = create<ParameterStore>((set, get) => ({
   parameters: new Map(),
   paramCount: 0,
+  downloadState: 'idle',
   metadata: null,
   isLoading: false,
   isLoadingMetadata: false,
@@ -384,14 +401,22 @@ export const useParameterStore = create<ParameterStore>((set, get) => ({
     return false;
   },
 
+  hasFullParameterSet: () => get().downloadState === 'complete',
+
+  needsParameterFetch: () => {
+    const state = get().downloadState;
+    return state === 'idle' || state === 'failed';
+  },
+
   fetchParameters: async () => {
-    set({ isLoading: true, error: null, progress: null });
+    set({ isLoading: true, downloadState: 'loading', error: null, progress: null });
 
     const result = await window.electronAPI?.requestAllParameters();
 
     if (!result?.success) {
       set({
         isLoading: false,
+        downloadState: 'failed',
         error: result?.error ?? 'Failed to request parameters'
       });
     }
@@ -622,6 +647,7 @@ export const useParameterStore = create<ParameterStore>((set, get) => ({
     set({
       parameters: newParams,
       paramCount: newParams.size,
+      downloadState: 'complete',
       isLoading: false,
       progress: null,
       error: null,
@@ -652,6 +678,7 @@ export const useParameterStore = create<ParameterStore>((set, get) => ({
       }
       return {
         parameters: params, paramCount: params.size,
+        downloadState: 'complete' as const,
         isLoading: false,
         progress: null,
         error: null,
@@ -660,7 +687,13 @@ export const useParameterStore = create<ParameterStore>((set, get) => ({
     });
   },
 
-  setError: (error) => set({ error, isLoading: false }),
+  setError: (error) => set(state => ({
+    error,
+    isLoading: false,
+    // A download that errored has not delivered a full set, so the next connect
+    // (or a Retry) must be allowed to try again.
+    downloadState: state.downloadState === 'loading' ? 'failed' : state.downloadState,
+  })),
 
   setSearchQuery: (query) => set({ searchQuery: query }),
 
@@ -1120,6 +1153,7 @@ export const useParameterStore = create<ParameterStore>((set, get) => ({
   reset: () => { userModifiedParams.clear(); stagedParams.clear(); set({
     parameters: new Map(),
     paramCount: 0,
+    downloadState: 'idle',
     metadata: null,
     isLoading: false,
     isLoadingMetadata: false,

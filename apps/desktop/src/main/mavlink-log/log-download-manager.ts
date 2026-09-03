@@ -8,8 +8,16 @@ import {
   serializeLogRequestEnd,
   LOG_REQUEST_END_ID,
   LOG_REQUEST_END_CRC_EXTRA,
+  serializeLogErase,
+  LOG_ERASE_ID,
+  LOG_ERASE_CRC_EXTRA,
+  serializeCommandLong,
+  COMMAND_LONG_ID,
+  COMMAND_LONG_CRC_EXTRA,
   deserializeLogEntry,
   deserializeLogData,
+  deserializeStorageInformation,
+  STORAGE_INFORMATION_ID,
   type LogEntry,
 } from '@ardudeck/mavlink-ts';
 
@@ -49,6 +57,9 @@ export class LogDownloadManager {
   private listResolve: ((entries: LogListEntry[]) => void) | null = null;
   private listTimer: ReturnType<typeof setTimeout> | null = null;
 
+  private storageResolve: ((info: { totalBytes: number; usedBytes: number; availableBytes: number } | null) => void) | null = null;
+  private storageTimer: ReturnType<typeof setTimeout> | null = null;
+
   constructor(
     private sendPacket: SendPacketFn,
     private writeTransport: WriteTransportFn,
@@ -63,7 +74,63 @@ export class LogDownloadManager {
       this.handleLogEntry(deserializeLogEntry(payload));
     } else if (msgid === MSG_LOG_DATA) {
       this.handleLogData(payload);
+    } else if (msgid === STORAGE_INFORMATION_ID) {
+      this.handleStorageInformation(payload);
     }
+  }
+
+  /** LOG_ERASE has no reply; re-request the log list to confirm. */
+  async eraseAllLogs(): Promise<void> {
+    const payload = serializeLogErase({
+      targetSystem: this.targetSystem,
+      targetComponent: this.targetComponent,
+    });
+    const packet = await this.sendPacket(LOG_ERASE_ID, payload, LOG_ERASE_CRC_EXTRA);
+    await this.writeTransport(packet);
+    this.log('warn', 'LOG_ERASE sent: erasing all logs on the vehicle SD card');
+  }
+
+  /** null = firmware never answered; message capacities are MiB, returned as bytes. */
+  async requestStorageInfo(): Promise<{ totalBytes: number; usedBytes: number; availableBytes: number } | null> {
+    const MAV_CMD_REQUEST_MESSAGE = 512;
+    const payload = serializeCommandLong({
+      targetSystem: this.targetSystem,
+      targetComponent: this.targetComponent,
+      command: MAV_CMD_REQUEST_MESSAGE,
+      confirmation: 0,
+      param1: STORAGE_INFORMATION_ID,
+      param2: 0, param3: 0, param4: 0, param5: 0, param6: 0, param7: 0,
+    });
+    return new Promise((resolve) => {
+      this.storageResolve = resolve;
+      this.storageTimer = setTimeout(() => this.resolveStorage(null), 3000);
+      this.sendPacket(COMMAND_LONG_ID, payload, COMMAND_LONG_CRC_EXTRA).then(async (packet) => {
+        await this.writeTransport(packet);
+      }).catch(() => this.resolveStorage(null));
+    });
+  }
+
+  private handleStorageInformation(payload: Uint8Array): void {
+    if (!this.storageResolve) return;
+    const info = deserializeStorageInformation(payload);
+    const MIB = 1024 * 1024;
+    this.resolveStorage({
+      totalBytes: info.totalCapacity * MIB,
+      usedBytes: info.usedCapacity * MIB,
+      availableBytes: info.availableCapacity * MIB,
+    });
+  }
+
+  private resolveStorage(
+    value: { totalBytes: number; usedBytes: number; availableBytes: number } | null,
+  ): void {
+    if (this.storageTimer) {
+      clearTimeout(this.storageTimer);
+      this.storageTimer = null;
+    }
+    const resolve = this.storageResolve;
+    this.storageResolve = null;
+    resolve?.(value);
   }
 
   private handleLogEntry(entry: LogEntry): void {

@@ -2608,6 +2608,7 @@ const MSG_MAG_CAL_REPORT = 192;
 const MSG_FENCE_STATUS = 162;
 const MSG_LOG_ENTRY = 118;
 const MSG_LOG_DATA = 120;
+const MSG_STORAGE_INFORMATION = 261;
 
 // MAVLink CRC_EXTRA values for v1 paths (manual payload construction without mission_type)
 // Per MAVLink spec, CRC_EXTRA excludes extension fields, so these match the generated v2 values
@@ -3835,7 +3836,8 @@ function parseTelemetry(mainWindow: BrowserWindow, packet: MAVLinkPacket): void 
     }
 
     case MSG_LOG_ENTRY:
-    case MSG_LOG_DATA: {
+    case MSG_LOG_DATA:
+    case MSG_STORAGE_INFORMATION: {
       if (logDownloadManager) {
         logDownloadManager.handleMessage(msgid, payload);
       }
@@ -12630,6 +12632,35 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
 
   ipcMain.handle(IPC_CHANNELS.LOG_DOWNLOAD_CANCEL, async () => {
     logDownloadManager?.cancel();
+  });
+
+  ipcMain.handle(IPC_CHANNELS.LOG_ERASE_ALL, async (): Promise<boolean> => {
+    if (!currentTransport) return false;
+    if (!logDownloadManager) {
+      logDownloadManager = new LogDownloadManager(
+        sendMavlinkPacket,
+        (data) => currentTransport!.write(data),
+        (level, msg) => mainWindow && sendLog(mainWindow, level as ConsoleLogEntry['level'], msg),
+        connectionState.systemId ?? 1,
+        1,
+      );
+    }
+    await logDownloadManager.eraseAllLogs();
+    return true;
+  });
+
+  ipcMain.handle(IPC_CHANNELS.LOG_STORAGE_INFO, async (): Promise<{ totalBytes: number; usedBytes: number; availableBytes: number } | null> => {
+    if (!currentTransport) return null;
+    if (!logDownloadManager) {
+      logDownloadManager = new LogDownloadManager(
+        sendMavlinkPacket,
+        (data) => currentTransport!.write(data),
+        (level, msg) => mainWindow && sendLog(mainWindow, level as ConsoleLogEntry['level'], msg),
+        connectionState.systemId ?? 1,
+        1,
+      );
+    }
+    return logDownloadManager.requestStorageInfo();
   });
 
   ipcMain.handle(IPC_CHANNELS.LOG_OPEN_DIALOG, async (): Promise<{ path: string } | null> => {

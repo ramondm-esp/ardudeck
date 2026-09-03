@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { lowerBoundIdx, upperBoundIdx, columnStats, fmtStat, padRange, chartCsv } from './log-chart-stats';
+import { lowerBoundIdx, upperBoundIdx, columnStats, fmtStat, padRange, parseAxisRange, chartCsv } from './log-chart-stats';
 
 describe('lowerBoundIdx / upperBoundIdx (visible-window index resolution)', () => {
   const x = [0, 1, 2, 3, 4, 5];
@@ -111,5 +111,21 @@ describe('chartCsv', () => {
   it('clamps the window to the data length', () => {
     const csv = chartCsv([[0, 1], [5, 6]], ['x'], -5, 99);
     expect(csv.split('\n')).toHaveLength(3);
+  });
+});
+
+describe('parseAxisRange', () => {
+  it('accepts a normal range', () => {
+    expect(parseAxisRange('-10', '10')).toEqual({ min: -10, max: 10 });
+    expect(parseAxisRange(' 0.5 ', ' 2.25 ')).toEqual({ min: 0.5, max: 2.25 });
+  });
+
+  it('rejects anything that would blank the plot', () => {
+    expect(parseAxisRange('10', '-10')).toBeNull();
+    expect(parseAxisRange('5', '5')).toBeNull();
+    expect(parseAxisRange('abc', '10')).toBeNull();
+    expect(parseAxisRange('', '10')).toBeNull();
+    expect(parseAxisRange('1', '')).toBeNull();
+    expect(parseAxisRange('1', 'Infinity')).toBeNull();
   });
 });

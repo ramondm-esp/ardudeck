@@ -805,6 +805,8 @@ export const IPC_CHANNELS = {
   LOG_DOWNLOAD_COMPLETE: 'log:download-complete',
   LOG_DOWNLOAD_ERROR: 'log:download-error',
   LOG_DOWNLOAD_CANCEL: 'log:download-cancel',
+  LOG_ERASE_ALL: 'log:erase-all',
+  LOG_STORAGE_INFO: 'log:storage-info',
   /** Show open-file dialog only (no read). Returns just the chosen path so
    *  the renderer never has to round-trip the file bytes through IPC — that
    *  was the root cause of multi-minute freezes on 100MB+ logs. */

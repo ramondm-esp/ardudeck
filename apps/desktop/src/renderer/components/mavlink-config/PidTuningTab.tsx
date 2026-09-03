@@ -32,11 +32,13 @@ type ControllerSet = 'vtol' | 'fixedwing';
 const PID_PROFILES_KEY = 'ardudeck_mavlink_pid_profiles';
 
 const PidTuningTab: React.FC = () => {
-  const { parameters, setParameter, fetchParameters, isLoading } = useParameterStore();
+  const { parameters, setParameter, fetchParameters, isLoading, downloadState } = useParameterStore();
   const showExplanationCards = useSettingsStore((s) => s.uiVisibility.showExplanationCards);
 
   // Check if parameters are loaded
-  const hasParameters = parameters.size > 0;
+  // A full download, not just whatever connect-time batch reads happened to
+  // land. Six stray parameters are not a board with an unrecognised PID scheme.
+  const hasParameters = downloadState === 'complete' && parameters.size > 0;
 
   // QuadPlanes run two control-law sets on one autopilot: the VTOL multicopter
   // rate controller (Q_A_RAT_*) and the fixed-wing controller (RLL_RATE_* /
@@ -228,8 +230,14 @@ const PidTuningTab: React.FC = () => {
               <Lightbulb className="w-5 h-5 text-amber-400" />
             </div>
             <div>
-              <p className="text-amber-300 font-medium">Parameters Not Loaded</p>
-              <p className="text-xs text-content-secondary">Fetch parameters from the FC to use presets and adjust values</p>
+              <p className="text-amber-300 font-medium">
+                {downloadState === 'failed' ? 'Parameter Download Failed' : 'Parameters Not Loaded'}
+              </p>
+              <p className="text-xs text-content-secondary">
+                {downloadState === 'failed'
+                  ? 'The vehicle did not send a full parameter set. Retry to pull them again.'
+                  : 'Fetch parameters from the FC to use presets and adjust values'}
+              </p>
             </div>
           </div>
           <button
@@ -237,7 +245,7 @@ const PidTuningTab: React.FC = () => {
             disabled={isLoading}
             className="px-4 py-2 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
           >
-            {isLoading ? 'Loading...' : 'Fetch Parameters'}
+            {isLoading ? 'Loading...' : downloadState === 'failed' ? 'Retry' : 'Fetch Parameters'}
           </button>
         </div>
       )}

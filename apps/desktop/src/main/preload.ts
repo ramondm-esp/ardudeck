@@ -968,6 +968,12 @@ const api = {
   logDownloadCancel: (): Promise<void> =>
     ipcRenderer.invoke(IPC_CHANNELS.LOG_DOWNLOAD_CANCEL),
 
+  logEraseAll: (): Promise<boolean> =>
+    ipcRenderer.invoke(IPC_CHANNELS.LOG_ERASE_ALL),
+
+  logStorageInfo: (): Promise<{ totalBytes: number; usedBytes: number; availableBytes: number } | null> =>
+    ipcRenderer.invoke(IPC_CHANNELS.LOG_STORAGE_INFO),
+
   logOpenDialog: (): Promise<{ path: string } | null> =>
     ipcRenderer.invoke(IPC_CHANNELS.LOG_OPEN_DIALOG),
 

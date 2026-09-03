@@ -594,8 +594,12 @@ function App() {
     if (connectionState.isConnected && connectionState.protocol !== 'msp') {
       // Small delay to ensure connection is stable
       const timer = setTimeout(() => {
-        // Only fetch params on fresh connection (not reconnection after reboot)
-        if (useParameterStore.getState().paramCount === 0) {
+        // Only fetch params on fresh connection (not reconnection after reboot).
+        // Keyed on the download state, not the count: connect-time batch reads
+        // (safety monitor, Q_ENABLE, calibration) put a handful of real
+        // parameters in the store first, and a count check reads those as "we
+        // already have them" and never downloads.
+        if (useParameterStore.getState().needsParameterFetch()) {
           fetchParameters();
         }
         // Fetch metadata based on vehicle type
@@ -632,10 +636,10 @@ function App() {
   const signingEnabled = useSigningStore((s) => s.enabled);
   const signingKeyMismatch = useSigningStore((s) => s.keyMismatch);
   useEffect(() => {
-    if (connectionState.isConnected && connectionState.protocol !== 'msp' && useParameterStore.getState().paramCount === 0) {
+    if (connectionState.isConnected && connectionState.protocol !== 'msp' && useParameterStore.getState().needsParameterFetch()) {
       // Signing state just changed - retry param fetch after short delay
       const timer = setTimeout(() => {
-        if (useParameterStore.getState().paramCount === 0) {
+        if (useParameterStore.getState().needsParameterFetch()) {
           fetchParameters();
         }
       }, 1000);

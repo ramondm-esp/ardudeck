@@ -20,10 +20,14 @@ import 'maplibre-gl/dist/maplibre-gl.css';
 // packaged builds (see ObjectEditorMap.tsx), breaking the MapLibre worker.
 maplibregl.setWorkerUrl(new URL('maplibre-worker.js', document.baseURI).href);
 import { createFlightPathThreeJsLayer } from './flight-threejs-layer';
+import { buildFlightTrack, frameBounds, groundAmsl, trackAltitudeRange, trackIndexAtTime, trackSpeeds } from './flight-track';
 import { useLogStore } from '../../stores/log-store';
-import { lowerBoundIdx, upperBoundIdx, columnStats, fmtStat, padRange, chartCsv, SERIES_COLORS, type FieldStats } from './log-chart-stats';
+import { lowerBoundIdx, upperBoundIdx, columnStats, fmtStat, padRange, parseAxisRange, chartCsv, SERIES_COLORS, type FieldStats } from './log-chart-stats';
 import { getModeName, MODE_COLORS } from './log-events';
 import { publishHoverTime, subscribeHoverTime, subscribeTimeJump } from './log-hover-bus';
+import { createCursorReadout, type ChartCursorReadout, type CursorRow } from './log-chart-cursor';
+import { groupSeriesByScale, scaleKeyFor, unitOfLabel, Y_MODE_LABEL, Y_MODE_ORDER, Y_MODE_TIP, type YMode } from './log-y-scales';
+import { wheelDeltas, wheelZoomFactor } from './log-chart-gestures';
 import { EventsPanel } from './EventsPanel';
 import { LogParamsPanel } from './LogParamsPanel';
 import { SpectrumPanel } from './SpectrumPanel';
@@ -122,137 +126,6 @@ function getModeTimeline(log: ReturnType<typeof useLogStore.getState>['currentLo
 
 // Reject points before GPS lock (null island) or out of range so the track
 // doesn't draw a line to 0,0.
-function isValidLatLng(lat: number, lng: number): boolean {
-  if (lat === 0 && lng === 0) return false;
-  if (Math.abs(lat) > 90 || Math.abs(lng) > 180) return false;
-  return true;
-}
-
-function getFlightPath(log: ReturnType<typeof useLogStore.getState>['currentLog']): [number, number, number][] {
-  if (!log) return [];
-  const path: [number, number, number][] = [];
-
-  // ArduPilot dataflash: GPS message with Lat/Lng (degrees) and Alt (meters).
-  const gps = log.messages['GPS'];
-  if (gps) {
-    for (const msg of gps) {
-      const lat = msg.fields['Lat'];
-      const lng = msg.fields['Lng'];
-      const alt = msg.fields['Alt'];
-      if (typeof lat === 'number' && typeof lng === 'number' && isValidLatLng(lat, lng)) {
-        path.push([lat, lng, typeof alt === 'number' ? alt : 0]);
-      }
-    }
-    return path;
-  }
-
-  // PX4 ULog: vehicle_gps_position / sensor_gps carry int32 lat/lon scaled by
-  // 1e7 and alt in mm AMSL.
-  const px4Gps = log.messages['vehicle_gps_position'] ?? log.messages['sensor_gps'];
-  if (px4Gps) {
-    for (const msg of px4Gps) {
-      const rawLat = msg.fields['lat'];
-      const rawLon = msg.fields['lon'];
-      const rawAlt = msg.fields['alt'];
-      if (typeof rawLat === 'number' && typeof rawLon === 'number') {
-        const lat = rawLat / 1e7;
-        const lng = rawLon / 1e7;
-        if (isValidLatLng(lat, lng)) {
-          path.push([lat, lng, typeof rawAlt === 'number' ? rawAlt / 1000 : 0]);
-        }
-      }
-    }
-    return path;
-  }
-
-  // PX4 ULog fallback: vehicle_global_position carries lat/lon already in
-  // degrees (double) and alt already in meters.
-  const px4Global = log.messages['vehicle_global_position'];
-  if (px4Global) {
-    for (const msg of px4Global) {
-      const lat = msg.fields['lat'];
-      const lng = msg.fields['lon'];
-      const alt = msg.fields['alt'];
-      if (typeof lat === 'number' && typeof lng === 'number' && isValidLatLng(lat, lng)) {
-        path.push([lat, lng, typeof alt === 'number' ? alt : 0]);
-      }
-    }
-    return path;
-  }
-
-  return path;
-}
-
-/**
- * Timestamps (seconds) index-aligned with getFlightPath's points - MUST apply
- * the identical validity filter so chart-hover time lookups land on the right
- * path vertex. Separate function (not a tuple return) to leave the many
- * existing flightPath consumers untouched.
- */
-function getFlightPathTimesS(log: ReturnType<typeof useLogStore.getState>['currentLog']): number[] {
-  if (!log) return [];
-  const gps = log.messages['GPS'];
-  if (!gps) return [];
-  const times: number[] = [];
-  for (const msg of gps) {
-    const lat = msg.fields['Lat'];
-    const lng = msg.fields['Lng'];
-    if (typeof lat === 'number' && typeof lng === 'number' && lat !== 0 && lng !== 0) {
-      times.push(msg.timeUs / 1_000_000);
-    }
-  }
-  return times;
-}
-
-/**
- * Per-track-point timestamps (microseconds) parallel to getFlightPath's
- * [lat,lng,alt] tuples. Same source-message selection and same validity
- * filtering, so index i of this array is the timeUs of flight-path point i.
- * Kept as an additive sibling so getFlightPath's tuple shape is unchanged.
- * PX4 ULogs use their own GPS topics.
- */
-function getFlightPathTimes(log: ReturnType<typeof useLogStore.getState>['currentLog']): number[] {
-  if (!log) return [];
-  const times: number[] = [];
-
-  const gps = log.messages['GPS'];
-  if (gps) {
-    for (const msg of gps) {
-      const lat = msg.fields['Lat'];
-      const lng = msg.fields['Lng'];
-      if (typeof lat === 'number' && typeof lng === 'number' && isValidLatLng(lat, lng)) {
-        times.push(msg.timeUs);
-      }
-    }
-    return times;
-  }
-
-  const px4Gps = log.messages['vehicle_gps_position'] ?? log.messages['sensor_gps'];
-  if (px4Gps) {
-    for (const msg of px4Gps) {
-      const rawLat = msg.fields['lat'];
-      const rawLon = msg.fields['lon'];
-      if (typeof rawLat === 'number' && typeof rawLon === 'number') {
-        if (isValidLatLng(rawLat / 1e7, rawLon / 1e7)) times.push(msg.timeUs);
-      }
-    }
-    return times;
-  }
-
-  const px4Global = log.messages['vehicle_global_position'];
-  if (px4Global) {
-    for (const msg of px4Global) {
-      const lat = msg.fields['lat'];
-      const lng = msg.fields['lon'];
-      if (typeof lat === 'number' && typeof lng === 'number' && isValidLatLng(lat, lng)) {
-        times.push(msg.timeUs);
-      }
-    }
-    return times;
-  }
-
-  return times;
-}
 
 /**
  * Build a (type, field) -> unit string lookup from the parsed log's UNIT/FMTU
@@ -381,13 +254,31 @@ function ChartPanel({ chartId }: { chartId: string }) {
   const [legendExpanded, setLegendExpanded] = useState(false);
 
   // Y-axis behaviour is PER-CHART local state (only the X window is synced
-  // across charts). 'fit' = one shared Y auto-fitted to the visible X window;
-  // 'independent' = every series on its own auto-scaled axis so signals of
-  // wildly different magnitude (e.g. altitude vs voltage) are both readable.
-  const [yMode, setYMode] = useState<'fit' | 'independent'>('fit');
+  // across charts).
+  //   'unit'   one axis per unit, the way Mission Planner's log browser groups
+  //            them: three altitudes in metres share a scale and stay directly
+  //            comparable, while volts get their own axis.
+  //   'shared' everything on one axis, including across units.
+  //   'field'  every field on its own auto-scaled axis, for comparing the
+  //            SHAPE of signals whose magnitudes have nothing in common.
+  const [yMode, setYMode] = useState<YMode>('unit');
   // True once the user manually zoomed/panned Y (shift-scroll or right-drag),
   // which locks Y so the auto-refit-on-X-change stops fighting the manual view.
   const yPinnedRef = useRef(false);
+  // Per-series Y range, keyed by series label. Split mode gives every field its
+  // own axis but only the first two get a drawn gutter to drag, so typing the
+  // range is the only control that reaches every series. A pinned series is
+  // exempt from auto-fit until it is reset.
+  const [seriesRanges, setSeriesRanges] = useState<Record<string, { min: number; max: number }>>({});
+  const seriesRangesRef = useRef(seriesRanges);
+  seriesRangesRef.current = seriesRanges;
+  // Which axis the Y gestures act on. Null = all of them, which is the only
+  // sensible default when there is one scale and the wrong one when there are
+  // three: zooming every axis at once moves nothing relative to anything.
+  const [activeScaleKey, setActiveScaleKey] = useState<string | null>(null);
+  const activeScaleKeyRef = useRef(activeScaleKey);
+  activeScaleKeyRef.current = activeScaleKey;
+  const refitYRef = useRef<((u: uPlot) => void) | null>(null);
   const [yZoomed, setYZoomed] = useState(false);
 
   const messageTypes = currentLog?.messageTypes ?? [];
@@ -607,7 +498,10 @@ function ChartPanel({ chartId }: { chartId: string }) {
     const seriesCount = chartData.series.length;
     const xData0 = chartData.data[0] as ArrayLike<number>;
     const seriesColor = (i: number) => SERIES_COLORS[i % SERIES_COLORS.length]!;
-    const independent = yMode === 'independent';
+    // Series indexes grouped by the scale they ride, in first-appearance order.
+    const scaleGroups = groupSeriesByScale(yMode, chartData.series.map((sr) => sr.label));
+    const scaleKeys = [...scaleGroups.keys()];
+    const perSeriesScale = yMode !== 'shared';
     const panTool = explorerTool === 'pan';
 
     // Auto-fit Y to the DATA WITHIN THE VISIBLE X WINDOW. Runs whenever X
@@ -617,7 +511,12 @@ function ChartPanel({ chartId }: { chartId: string }) {
     // control of Y (shift-scroll / right-drag / vertical box), which pins it.
     let refitting = false;
     const refitY = (u: uPlot) => {
-      if (yPinnedRef.current || refitting) return;
+      if (refitting) return;
+      const pins = seriesRangesRef.current;
+      const anyPinned = scaleKeys.some((k) => pins[k]);
+      // A globally pinned Y (shift-scroll / box drag) stops auto-fit, but typed
+      // per-series ranges still have to be re-applied or a rebuild loses them.
+      if (yPinnedRef.current && !anyPinned) return;
       const xn = xData0.length;
       if (xn === 0) return;
       const xmin = u.scales.x?.min ?? xData0[0]!;
@@ -627,19 +526,21 @@ function ChartPanel({ chartId }: { chartId: string }) {
       if (hi < lo) return;
       refitting = true;
       u.batch(() => {
-        if (independent) {
-          for (let i = 0; i < seriesCount; i++) {
-            const [mn, mx] = padRange(columnStats(u.data[i + 1] as ArrayLike<number>, lo, hi));
-            u.setScale(`y${i}`, { min: mn, max: mx });
-          }
-        } else {
+        for (const [key, members] of scaleGroups) {
+          const pin = pins[key];
+          if (pin) { u.setScale(key, { min: pin.min, max: pin.max }); continue; }
+          if (yPinnedRef.current) continue;
+          // A scale spans every series sharing it, so same-unit fields keep a
+          // common frame of reference instead of each filling the panel.
           let mn = Infinity;
           let mx = -Infinity;
-          for (let i = 0; i < seriesCount; i++) {
+          for (const i of members) {
             const st = columnStats(u.data[i + 1] as ArrayLike<number>, lo, hi);
             if (st) { if (st.min < mn) mn = st.min; if (st.max > mx) mx = st.max; }
           }
-          if (mn <= mx) { const [a, b] = padRange({ min: mn, max: mx, avg: 0, last: 0, count: 1 }); u.setScale('y', { min: a, max: b }); }
+          if (mn > mx) continue;
+          const [a, b] = padRange({ min: mn, max: mx, avg: 0, last: 0, count: 1 });
+          u.setScale(key, { min: a, max: b });
         }
       });
       refitting = false;
@@ -653,39 +554,52 @@ function ChartPanel({ chartId }: { chartId: string }) {
     };
     const xAxis: uPlot.Axis = { label: 'Time (s)', ...axisTheme };
 
-    // Series labels carry a "(unit)" suffix from the log's UNIT records; pull
-    // it back out so the y axes can be labeled with the unit they display.
-    const unitOfLabel = (label: string): string | undefined => /\(([^()]+)\)$/.exec(label)?.[1];
-
-    // In independent mode each series rides its own scale (y0..yN) so a signal
-    // at 0-1 and one at 0-1000 are both full-height. Only the first two get a
-    // drawn axis gutter (left = series 0, right = series 1), colour-matched to
-    // their line; the remaining scales stay live (values in the legend) without
-    // cluttering the plot with a wall of axes.
+    // One drawn axis per scale, alternating left/right the way Mission Planner
+    // stacks its YAxisList / Y2AxisList. Every scale gets a gutter: an axis a
+    // series rides but that is nowhere on screen is unreadable by definition.
     const scales: uPlot.Scales = { x: { time: false } };
-    let axes: uPlot.Axis[];
-    let seriesOpts: uPlot.Series[];
-    if (independent) {
-      for (let i = 0; i < seriesCount; i++) scales[`y${i}`] = { auto: true };
-      axes = [xAxis];
-      if (seriesCount > 0) axes.push({ ...axisTheme, scale: 'y0', side: 3, stroke: seriesColor(0), label: unitOfLabel(chartData.series[0]!.label) });
-      if (seriesCount > 1) axes.push({ ...axisTheme, scale: 'y1', side: 1, stroke: seriesColor(1), label: unitOfLabel(chartData.series[1]!.label), grid: { show: false, stroke: 'transparent', width: 0 } });
-      seriesOpts = [
-        { label: 'Time' },
-        ...chartData.series.map((s, i) => ({ label: s.label, stroke: seriesColor(i), width: 1.5, scale: `y${i}`, points: { show: false } })),
-      ];
-    } else {
-      scales.y = { auto: true };
-      // Label the shared axis only when every series agrees on one unit;
-      // a mixed-unit axis would be labeled with a lie.
-      const units = chartData.series.map((s) => unitOfLabel(s.label));
-      const sharedUnit = units.length > 0 && units[0] && units.every((u) => u === units[0]) ? units[0] : undefined;
-      axes = [xAxis, { ...axisTheme, scale: 'y', side: 3, label: sharedUnit }];
-      seriesOpts = [
-        { label: 'Time' },
-        ...chartData.series.map((s, i) => ({ label: s.label, stroke: seriesColor(i), width: 1.5, points: { show: false } })),
-      ];
-    }
+    for (const key of scaleKeys) scales[key] = { auto: true };
+
+    const axisLabelFor = (key: string, members: number[]): string | undefined => {
+      if (yMode === 'field') return chartData.series[members[0]!]!.label;
+      const unit = key.startsWith('u_') ? key.slice(2) : undefined;
+      if (unit) return unit;
+      // Shared mode names the axis only when every series agrees on one unit;
+      // labelling a mixed-unit axis would be labelling it with a lie.
+      const units = members.map((i) => unitOfLabel(chartData.series[i]!.label));
+      return units.length > 0 && units[0] && units.every((u) => u === units[0]) ? units[0] : undefined;
+    };
+
+    const axes: uPlot.Axis[] = [xAxis];
+    [...scaleGroups.entries()].forEach(([key, members], n) => {
+      axes.push({
+        ...axisTheme,
+        scale: key,
+        side: n % 2 === 0 ? 3 : 1,
+        // Colour the gutter to its series only when it carries just one, else
+        // the colour would claim the axis belongs to one of several fields.
+        stroke: members.length === 1 && perSeriesScale ? seriesColor(members[0]!) : axisTheme.stroke,
+        label: axisLabelFor(key, members),
+        // Only the first axis draws gridlines; several overlaid grids on
+        // different scales is visual noise that lines up with nothing.
+        ...(n === 0 ? {} : { grid: { show: false, stroke: 'transparent', width: 0 } }),
+      });
+    });
+
+    const seriesOpts: uPlot.Series[] = [
+      { label: 'Time' },
+      ...chartData.series.map((s, i) => ({
+        label: s.label,
+        stroke: seriesColor(i),
+        width: 1.5,
+        scale: scaleKeyFor(yMode, s.label, i),
+        points: { show: false },
+      })),
+    ];
+
+    // Null until the plot exists: the readout attaches to plot.over, and uPlot
+    // fires setCursor during construction, before that assignment can happen.
+    let readout: ChartCursorReadout | null = null;
 
     const opts: uPlot.Options = {
       width: Math.max(width, 300),
@@ -700,7 +614,7 @@ function ChartPanel({ chartId }: { chartId: string }) {
         // Pan tool: left-drag pans instead (handled below), so box-select is off.
         drag: panTool
           ? { x: false, y: false, setScale: false }
-          : independent ? { x: true, y: false, uni: 50, setScale: false } : { x: true, y: true, uni: 40, setScale: false },
+          : scaleKeys.length > 1 ? { x: true, y: false, uni: 50, setScale: false } : { x: true, y: true, uni: 40, setScale: false },
         // Crosshair follows the same time value on every chart panel.
         sync: { key: X_CURSOR_SYNC_KEY, setSeries: false, scales: ['x', null] },
       },
@@ -711,13 +625,35 @@ function ChartPanel({ chartId }: { chartId: string }) {
         // along the trajectory. Only the chart actually under the mouse
         // publishes - synced charts re-fire this hook and must stay silent.
         setCursor: [(u) => {
+          // Values under the crosshair. Runs on synced siblings too, so every
+          // chart shows its own numbers, but only the hovered one owns the
+          // shared hover time.
+          const idx = u.cursor.idx;
+          const left = u.cursor.left ?? -1;
+          const top = u.cursor.top ?? -1;
+          if (idx == null || left < 0 || top < 0) {
+            readout?.update(null, 0, []);
+          } else {
+            const xs = u.data[0] as ArrayLike<number>;
+            const rows: CursorRow[] = [];
+            for (let si = 1; si < u.series.length; si++) {
+              const ser = u.series[si]!;
+              if (ser.show === false) continue;
+              rows.push({
+                label: String(ser.label ?? `s${si}`),
+                color: typeof ser.stroke === 'string' ? ser.stroke : seriesColor(si - 1),
+                value: (u.data[si] as ArrayLike<number> | undefined)?.[idx],
+              });
+            }
+            readout?.update({ left, top }, xs[idx] ?? 0, rows);
+          }
+
           if (!u.over.matches(':hover')) return;
-          const l = u.cursor.left;
-          publishHoverTime(l == null || l < 0 ? null : u.posToVal(l, 'x'));
+          publishHoverTime(left < 0 ? null : u.posToVal(left, 'x'));
         }],
         setSelect: [(u) => {
           const zoomX = u.select.width > 10;
-          const zoomY = u.select.height > 10 && !independent;
+          const zoomY = u.select.height > 10 && scaleKeys.length === 1;
           if (zoomY) {
             // Pin Y BEFORE touching X so the X setScale hook's auto-refit does
             // not clobber the box we are about to set.
@@ -803,6 +739,94 @@ function ChartPanel({ chartId }: { chartId: string }) {
     if (plotRef.current) plotRef.current.destroy();
     const plot = new uPlot(opts, chartData.data, container);
     plotRef.current = plot;
+    refitYRef.current = refitY;
+    refitY(plot);
+
+    // Direct manipulation on each Y axis: scroll over a gutter to zoom that
+    // scale, drag it to pan, double-click to hand it back to auto-fit. uPlot
+    // gives every axis its own positioned `.u-axis` element in axes-array
+    // order, so this needs no hit-testing and no private fields.
+    const axisCleanups: (() => void)[] = [];
+    {
+      const axisEls = plot.root.querySelectorAll<HTMLElement>('.u-axis');
+      // Index 0 is the time axis; the rest follow scaleKeys in order.
+      scaleKeys.forEach((key, n) => {
+        const el = axisEls[n + 1];
+        if (!el) return;
+        el.style.cursor = 'ns-resize';
+        el.style.pointerEvents = 'auto';
+        el.title = 'Scroll to zoom this axis, drag to pan, double-click for auto';
+
+        // Pin as we go: without recording the range, the next auto-refit on an
+        // X change would immediately undo the gesture. The ref is written
+        // alongside the state so a refit before React re-renders still sees it.
+        const applyRange = (min: number, max: number) => {
+          if (!Number.isFinite(min) || !Number.isFinite(max) || min >= max) return;
+          plot.setScale(key, { min, max });
+          seriesRangesRef.current = { ...seriesRangesRef.current, [key]: { min, max } };
+          setSeriesRanges((prev) => ({ ...prev, [key]: { min, max } }));
+        };
+
+        const onWheel = (e: WheelEvent) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const sc = plot.scales[key];
+          if (!sc || sc.min == null || sc.max == null) return;
+          const rect = plot.over.getBoundingClientRect();
+          const pct = rect.height > 0
+            ? Math.min(Math.max((e.clientY - rect.top) / rect.height, 0), 1)
+            : 0.5;
+          const range = sc.max - sc.min;
+          const anchor = sc.max - pct * range;
+          // Same exponential response as the plot's own wheel handling: a fixed
+          // step per event is unusable on a trackpad's stream of small deltas.
+          const next = range * wheelZoomFactor(e);
+          const nMax = anchor + pct * next;
+          applyRange(nMax - next, nMax);
+        };
+
+        const onDown = (e: MouseEvent) => {
+          if (e.button !== 0) return;
+          e.preventDefault();
+          e.stopPropagation();
+          const sc = plot.scales[key];
+          if (!sc || sc.min == null || sc.max == null) return;
+          const startY = e.clientY;
+          const startMin = sc.min;
+          const startMax = sc.max;
+          const height = plot.over.getBoundingClientRect().height || 1;
+          const move = (ev: MouseEvent) => {
+            // Dragging down pulls the trace down, so the window moves up.
+            const shift = ((ev.clientY - startY) / height) * (startMax - startMin);
+            applyRange(startMin + shift, startMax + shift);
+          };
+          const up = () => {
+            window.removeEventListener('mousemove', move);
+            window.removeEventListener('mouseup', up);
+          };
+          window.addEventListener('mousemove', move);
+          window.addEventListener('mouseup', up);
+        };
+
+        const onDblClick = (e: MouseEvent) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const { [key]: _dropped, ...rest } = seriesRangesRef.current;
+          seriesRangesRef.current = rest;
+          setSeriesRanges(rest);
+        };
+
+        el.addEventListener('wheel', onWheel, { passive: false });
+        el.addEventListener('mousedown', onDown);
+        el.addEventListener('dblclick', onDblClick);
+        axisCleanups.push(() => {
+          el.removeEventListener('wheel', onWheel);
+          el.removeEventListener('mousedown', onDown);
+          el.removeEventListener('dblclick', onDblClick);
+        });
+      });
+    }
+    readout = createCursorReadout(plot.over);
 
     // A rebuild (Y-mode switch, theme change, new fields) resets the plot to
     // the full time range. Re-apply the active zoom window so the user's view
@@ -811,9 +835,7 @@ function ChartPanel({ chartId }: { chartId: string }) {
       plot.setScale('x', { min: xRange.min, max: xRange.max });
     }
 
-    const yScaleKeys = independent
-      ? chartData.series.map((_, i) => `y${i}`)
-      : ['y'];
+    const yScaleKeys = scaleKeys;
 
     const xExtent = (): [number, number] => {
       const xd = chartData.data[0] as Float64Array;
@@ -835,26 +857,17 @@ function ChartPanel({ chartId }: { chartId: string }) {
     const handleWheel = (e: WheelEvent) => {
       e.preventDefault();
       const rect = plot.over.getBoundingClientRect();
-      // Normalize deltaMode: 1 = lines (~16px each), 2 = pages.
-      const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 100 : 1;
-      // macOS reroutes deltaY to deltaX while shift is held; take whichever moved.
-      const rawDy = (Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX) * unit;
-      const dx = e.deltaX * unit;
-
-      // Zoom proportional to scroll delta, exponential so it composes smoothly.
-      // A notchy mouse wheel sends ~100/event (=~1.2x steps); a touchpad sends
-      // a stream of 2-10px deltas (=~1.01x each) - the old fixed 1.3x per event
-      // made touchpads rocket past the target. Pinch (ctrl+wheel) gets extra
-      // gain because pinch deltas are small.
-      const gain = e.ctrlKey ? 0.006 : 0.002;
-      const zoomFactor = Math.exp(Math.min(Math.max(rawDy, -240), 240) * gain);
+      const { dx, dy } = wheelDeltas(e);
+      const zoomFactor = wheelZoomFactor(e);
 
       // Shift+scroll zooms Y (anchored under the cursor), leaving the time
       // window untouched - MP has no equivalent quick vertical zoom.
       if (e.shiftKey) {
         const pctTop = rect.height > 0 ? Math.min(Math.max((e.clientY - rect.top) / rect.height, 0), 1) : 0.5;
+        const active = activeScaleKeyRef.current;
+        const targets = active && yScaleKeys.includes(active) ? [active] : yScaleKeys;
         plot.batch(() => {
-          for (const k of yScaleKeys) {
+          for (const k of targets) {
             const s = plot.scales[k];
             if (!s || s.min == null || s.max == null) continue;
             const r = s.max - s.min;
@@ -874,7 +887,7 @@ function ChartPanel({ chartId }: { chartId: string }) {
       const range = xMax - xMin;
 
       // Two-finger horizontal scroll pans time - the natural touchpad gesture.
-      if (!e.ctrlKey && Math.abs(dx) > Math.abs(e.deltaY) * unit && rect.width > 0) {
+      if (!e.ctrlKey && Math.abs(dx) > Math.abs(dy) && rect.width > 0) {
         const shift = (dx / rect.width) * range;
         setXWindow(xMin + shift, xMax + shift);
         return;
@@ -951,7 +964,7 @@ function ChartPanel({ chartId }: { chartId: string }) {
 
     // The setCursor hook can't see the mouse leave (uPlot parks the cursor at
     // -10 without :hover matching), so clear the map hover marker explicitly.
-    const onLeave = () => publishHoverTime(null);
+    const onLeave = () => { publishHoverTime(null); readout?.update(null, 0, []); };
     plot.over.addEventListener('mouseleave', onLeave);
     if (panTool) plot.over.style.cursor = 'grab';
 
@@ -966,6 +979,8 @@ function ChartPanel({ chartId }: { chartId: string }) {
       container.removeEventListener('contextmenu', onContextMenu);
       container.removeEventListener('dblclick', handleDblClick);
       plot.over.removeEventListener('mouseleave', onLeave);
+      for (const off of axisCleanups) off();
+      readout?.destroy();
       window.removeEventListener('mousemove', onPanMove);
       window.removeEventListener('mouseup', onPanUp);
       if (plotRef.current) { plotRef.current.destroy(); plotRef.current = null; }
@@ -975,6 +990,14 @@ function ChartPanel({ chartId }: { chartId: string }) {
     // zoom tick. The synced-range effect below drives live zoom updates instead.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chartData, isLight, modeTimeline, applyZoom, yMode, explorerTool]);
+
+  // A typed range applies through the same refit path the chart already uses,
+  // so it survives X zoom/pan without rebuilding the plot.
+  useEffect(() => {
+    const plot = plotRef.current;
+    if (plot) refitYRef.current?.(plot);
+  }, [seriesRanges]);
+
 
   // Apply the synchronized zoom range to this chart's plot whenever the
   // store value changes (i.e. another chart drove the zoom). Local zoom is
@@ -1022,6 +1045,11 @@ function ChartPanel({ chartId }: { chartId: string }) {
     if (plotRef.current && chartData) {
       yPinnedRef.current = false;
       setYZoomed(false);
+      // "Reset both axes" includes typed per-axis ranges and the axis the Y
+      // gestures were aimed at; leaving either would make the button look like
+      // it did nothing for those fields.
+      setSeriesRanges({});
+      setActiveScaleKey(null);
       const xData = chartData.data[0] as Float64Array;
       // Clears the X window; the setScale('x') hook auto-refits Y to full log.
       plotRef.current.setScale('x', { min: xData[0]!, max: xData[xData.length - 1]! });
@@ -1117,7 +1145,31 @@ function ChartPanel({ chartId }: { chartId: string }) {
         // table rather than a flat run-on list. With many series this is
         // dramatically denser — 26 items become 8 type rows, and the user
         // can still see every field name and its line color.
-        type SeriesEntry = { label: string; field: string; color: string; stats: FieldStats | null };
+        type SeriesEntry = {
+          label: string; field: string; color: string; stats: FieldStats | null;
+          /** uPlot scale this row rides; rows sharing one move together. */
+          scaleKey: string;
+          /** Axis range currently in force: the typed one, else the auto fit. */
+          range: { min: number; max: number } | null;
+          pinned: boolean;
+        };
+        // Auto range per scale, over every series riding it, so the number the
+        // editor shows is the one the axis is actually using.
+        const scaleAutoRanges = new Map<string, { min: number; max: number }>();
+        chartData.series.forEach((s, i) => {
+          const st = seriesStats[i];
+          if (!st) return;
+          const key = scaleKeyFor(yMode, s.label, i);
+          const prev = scaleAutoRanges.get(key);
+          scaleAutoRanges.set(key, prev
+            ? { min: Math.min(prev.min, st.min), max: Math.max(prev.max, st.max) }
+            : { min: st.min, max: st.max });
+        });
+        for (const [key, r] of scaleAutoRanges) {
+          const [a, b] = padRange({ min: r.min, max: r.max, avg: 0, last: 0, count: 1 });
+          scaleAutoRanges.set(key, { min: a, max: b });
+        }
+
         const groups = new Map<string, SeriesEntry[]>();
         chartData.series.forEach((s, i) => {
           const color = SERIES_COLORS[i % SERIES_COLORS.length]!;
@@ -1129,9 +1181,24 @@ function ChartPanel({ chartId }: { chartId: string }) {
           const inst = m?.[2] ?? '';
           const field = m?.[3] ?? s.label;
           const display = inst ? `${field}${inst}` : field;
+          const stats = seriesStats[i] ?? null;
+          const key = scaleKeyFor(yMode, s.label, i);
+          const pin = seriesRanges[key];
+          const auto = scaleAutoRanges.get(key) ?? null;
           if (!groups.has(type)) groups.set(type, []);
-          groups.get(type)!.push({ label: s.label, field: display, color, stats: seriesStats[i] ?? null });
+          groups.get(type)!.push({
+            label: s.label,
+            field: display,
+            color,
+            stats,
+            scaleKey: key,
+            range: pin ?? auto,
+            pinned: pin !== undefined,
+          });
         });
+        const legendColumns = yMode !== 'shared'
+          ? '1fr 3.4rem 3.4rem 3.4rem 9.5rem'
+          : '1fr 3.4rem 3.4rem 3.4rem';
         const groupCount = groups.size;
         const seriesCount = chartData.series.length;
         // Inline summary fits comfortably up to ~6 series; past that, default
@@ -1208,20 +1275,18 @@ function ChartPanel({ chartId }: { chartId: string }) {
                   </svg>
                 </button>
                 <button
-                  onClick={() => setYMode(yMode === 'fit' ? 'independent' : 'fit')}
+                  onClick={() => setYMode(Y_MODE_ORDER[(Y_MODE_ORDER.indexOf(yMode) + 1) % Y_MODE_ORDER.length]!)}
                   className={`text-[10px] px-1.5 py-0.5 rounded border transition-colors flex items-center gap-1 ${
-                    yMode === 'independent'
+                    yMode !== 'shared'
                       ? 'bg-blue-500/15 hover:bg-blue-500/25 text-blue-400 border-blue-500/40'
                       : 'bg-surface hover:bg-surface-raised text-content-secondary hover:text-content border-subtle'
                   }`}
-                  data-tip={yMode === 'independent'
-                    ? 'Independent Y axes: every field auto-scaled on its own axis'
-                    : 'Shared Y axis, auto-fit to the visible time window'}
+                  data-tip={Y_MODE_TIP[yMode]}
                 >
                   <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v16M4 20h16M8 16l3-6 3 4 4-8" />
                   </svg>
-                  <span>{yMode === 'independent' ? 'Y: Indep' : 'Y: Fit'}</span>
+                  <span>{Y_MODE_LABEL[yMode]}</span>
                 </button>
                 {chartIds.length > 1 && (
                   <button
@@ -1264,12 +1329,13 @@ function ChartPanel({ chartId }: { chartId: string }) {
               <div className="px-3 pb-1.5 max-h-[160px] overflow-y-auto">
                 <div
                   className="grid items-center text-[9px] uppercase tracking-wider text-content-tertiary pb-0.5 sticky top-0 bg-surface-overlay-subtle"
-                  style={{ gridTemplateColumns: '1fr 3.4rem 3.4rem 3.4rem' }}
+                  style={{ gridTemplateColumns: legendColumns }}
                 >
                   <span>{xRange ? 'field · visible window' : 'field · full log'}</span>
                   <span className="text-right">min</span>
                   <span className="text-right">avg</span>
                   <span className="text-right">max</span>
+                  {yMode !== 'shared' && <span className="text-center">y axis</span>}
                 </div>
                 {[...groups.entries()].map(([type, items]) => (
                   <div key={type}>
@@ -1277,9 +1343,14 @@ function ChartPanel({ chartId }: { chartId: string }) {
                     {items.map((it) => (
                       <div
                         key={it.label}
-                        className="grid items-center gap-x-1 text-[10px] leading-tight py-[1px]"
-                        style={{ gridTemplateColumns: '1fr 3.4rem 3.4rem 3.4rem' }}
-                        title={it.label}
+                        onClick={() => setActiveScaleKey((k) => (k === it.scaleKey ? null : it.scaleKey))}
+                        className={`grid items-center gap-x-1 text-[10px] leading-tight py-[1px] rounded-sm cursor-pointer ${
+                          activeScaleKey === it.scaleKey ? 'bg-blue-500/15' : 'hover:bg-surface-raised'
+                        }`}
+                        style={{ gridTemplateColumns: legendColumns }}
+                        data-tip={activeScaleKey === it.scaleKey
+                          ? 'This axis takes the Y gestures: shift+scroll over the plot zooms it. Click to release.'
+                          : 'Click to aim shift+scroll at this axis alone'}
                       >
                         <span className="inline-flex items-center gap-1.5 min-w-0">
                           <span className="w-3 h-[3px] rounded-full shrink-0" style={{ backgroundColor: it.color }} />
@@ -1288,6 +1359,19 @@ function ChartPanel({ chartId }: { chartId: string }) {
                         <span className="text-right tabular-nums text-content-tertiary">{it.stats ? fmtStat(it.stats.min) : '-'}</span>
                         <span className="text-right tabular-nums text-content">{it.stats ? fmtStat(it.stats.avg) : '-'}</span>
                         <span className="text-right tabular-nums text-content-tertiary">{it.stats ? fmtStat(it.stats.max) : '-'}</span>
+                        {yMode !== 'shared' && (
+                          <AxisRangeEditor
+                            range={it.range}
+                            active={activeScaleKey === it.scaleKey}
+                            pinned={it.pinned}
+                            onCommit={(min, max) => setSeriesRanges((prev) => ({ ...prev, [it.scaleKey]: { min, max } }))}
+                            onReset={() => setSeriesRanges((prev) => {
+                              const next = { ...prev };
+                              delete next[it.scaleKey];
+                              return next;
+                            })}
+                          />
+                        )}
                       </div>
                     ))}
                   </div>
@@ -1346,22 +1430,110 @@ const FLIGHT_MAP_LAYERS: Record<string, { name: string; tiles: string[]; maxZoom
   terrain: { name: 'Terrain', tiles: ['https://a.tile.opentopomap.org/{z}/{x}/{y}.png', 'https://b.tile.opentopomap.org/{z}/{x}/{y}.png', 'https://c.tile.opentopomap.org/{z}/{x}/{y}.png'], maxZoom: 17 },
 };
 
+/**
+ * Min/max entry for one series' Y axis in split mode. Shows the auto-fitted
+ * range until the user types over it; a pinned axis is exempt from auto-fit
+ * and shows a reset back to it.
+ */
+function AxisRangeEditor({
+  range,
+  pinned,
+  active,
+  onCommit,
+  onReset,
+}: {
+  range: { min: number; max: number } | null;
+  pinned: boolean;
+  active: boolean;
+  onCommit: (min: number, max: number) => void;
+  onReset: () => void;
+}) {
+  const [draft, setDraft] = useState<{ min: string; max: string } | null>(null);
+  const shown = draft ?? {
+    min: range ? fmtStat(range.min) : '',
+    max: range ? fmtStat(range.max) : '',
+  };
+
+  const commit = (next: { min: string; max: string }) => {
+    setDraft(null);
+    const parsed = parseAxisRange(next.min, next.max);
+    if (parsed) onCommit(parsed.min, parsed.max);
+  };
+
+  const cell =
+    'w-[3.05rem] px-1 py-[1px] rounded border bg-surface text-[10px] tabular-nums text-right ' +
+    'text-content focus:outline-none focus:border-blue-500/60 ' +
+    (active ? 'border-blue-500/50' : 'border-subtle');
+
+  return (
+    <span
+      className="flex items-center gap-0.5 justify-end"
+      onClick={(e) => e.stopPropagation()}
+    >
+      <input
+        aria-label="Y axis minimum"
+        className={cell}
+        value={shown.min}
+        onChange={(e) => setDraft({ ...shown, min: e.target.value })}
+        onBlur={() => commit(shown)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+          if (e.key === 'Escape') setDraft(null);
+        }}
+      />
+      <input
+        aria-label="Y axis maximum"
+        className={cell}
+        value={shown.max}
+        onChange={(e) => setDraft({ ...shown, max: e.target.value })}
+        onBlur={() => commit(shown)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+          if (e.key === 'Escape') setDraft(null);
+        }}
+      />
+      <button
+        onClick={onReset}
+        disabled={!pinned}
+        className={`px-1 rounded text-[10px] leading-none transition-colors ${
+          pinned
+            ? 'text-blue-400 hover:text-blue-300'
+            : 'text-content-tertiary opacity-40 cursor-default'
+        }`}
+        data-tip={pinned ? 'Back to auto-fit for this field' : 'Auto-fitted to the visible window'}
+      >
+        auto
+      </button>
+    </span>
+  );
+}
+
 type PathColorMode = 'solid' | 'mode' | 'altitude' | 'speed';
+
+/** Smallest ground area the camera frames, so a short hover still has context. */
+const FRAME_MIN_SPAN_M = 90;
+/** Zoom ceiling: past this the camera sits on (or in) the terrain surface. */
+const FRAME_MAX_ZOOM = 18.5;
+
+/** Blue to cyan to green to yellow to red, for a normalised 0-1 value. */
+function rampColor(t: number): string {
+  const c = Math.min(1, Math.max(0, t));
+  let r: number, g: number, b: number;
+  if (c < 0.25) { r = 0; g = Math.round(c * 4 * 255); b = 255; }
+  else if (c < 0.5) { r = 0; g = 255; b = Math.round((1 - (c - 0.25) * 4) * 255); }
+  else if (c < 0.75) { r = Math.round((c - 0.5) * 4 * 255); g = 255; b = 0; }
+  else { r = 255; g = Math.round((1 - (c - 0.75) * 4) * 255); b = 0; }
+  return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
+}
 
 function FlightPathPanel() {
   const currentLog = useLogStore((s) => s.currentLog);
   const isUlog = currentLog?.format === 'ulog';
-  const flightPath = useMemo(() => getFlightPath(currentLog), [currentLog]);
-  const flightTimes = useMemo(() => getFlightPathTimesS(currentLog), [currentLog]);
+  const track = useMemo(() => buildFlightTrack(currentLog), [currentLog]);
+  const points = track.points;
   // ArduPilot colors by MODE records; PX4 ULogs color by vehicle_status.nav_state.
   const modeTimeline = useMemo(
     () => (isUlog ? getPx4ModeTimeline(currentLog) : getModeTimeline(currentLog)),
-    [currentLog, isUlog],
-  );
-  // Per-track-point times, only needed to align PX4 mode segments by timestamp
-  // (PX4 nav_state and the GPS track sample on independent clocks).
-  const flightPathTimes = useMemo(
-    () => (isUlog ? getFlightPathTimes(currentLog) : []),
     [currentLog, isUlog],
   );
   const mapContainerRef = useRef<HTMLDivElement>(null);
@@ -1372,21 +1544,17 @@ function FlightPathPanel() {
 
   // Compute per-segment colors based on color mode
   const segmentColors = useMemo(() => {
-    if (flightPath.length < 2) return undefined;
+    if (points.length < 2) return undefined;
 
     if (colorMode === 'solid') return undefined; // default amber
 
     if (colorMode === 'mode' && modeTimeline.length > 0) {
       const colors: string[] = [];
-      // ArduPilot track points are the GPS records in order, so point i maps to
-      // GPS[i].timeUs. PX4 builds the track from a parallel timeUs array because
-      // the GPS topic and the mode source (vehicle_status) are sampled on their
-      // own independent clocks; align each point to the active mode by time.
-      const gps = currentLog?.messages['GPS'];
-      for (let i = 0; i < flightPath.length - 1; i++) {
-        const timeUs = isUlog ? (flightPathTimes[i] ?? 0) : (gps?.[i]?.timeUs ?? 0);
-        const timeS = timeUs / 1_000_000;
-        // Find which mode segment this point falls in
+      // Every point carries its own timestamp, so modes align by time rather
+      // than by index: the mode source and the position source run on their own
+      // clocks and at their own rates.
+      for (let i = 0; i < points.length - 1; i++) {
+        const timeS = points[i]!.timeS;
         let color = '#6b7280';
         for (const seg of modeTimeline) {
           if (timeS >= seg.startS && timeS < seg.endS) {
@@ -1401,62 +1569,42 @@ function FlightPathPanel() {
 
     if (colorMode === 'altitude') {
       // Color by altitude: blue (low) → green → yellow → red (high)
-      const alts = flightPath.map(p => p[2]);
-      const minAlt = Math.min(...alts);
-      const maxAlt = Math.max(...alts);
+      const { min: minAlt, max: maxAlt } = trackAltitudeRange(points);
       const range = maxAlt - minAlt || 1;
       const colors: string[] = [];
-      for (let i = 0; i < flightPath.length - 1; i++) {
-        const t = (flightPath[i]![2] - minAlt) / range; // 0-1
-        // Blue → Cyan → Green → Yellow → Red
-        let r: number, g: number, b: number;
-        if (t < 0.25) { r = 0; g = Math.round(t * 4 * 255); b = 255; }
-        else if (t < 0.5) { r = 0; g = 255; b = Math.round((1 - (t - 0.25) * 4) * 255); }
-        else if (t < 0.75) { r = Math.round((t - 0.5) * 4 * 255); g = 255; b = 0; }
-        else { r = 255; g = Math.round((1 - (t - 0.75) * 4) * 255); b = 0; }
-        colors.push(`#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`);
+      for (let i = 0; i < points.length - 1; i++) {
+        colors.push(rampColor((points[i]!.altRel - minAlt) / range));
       }
       return colors;
     }
 
     if (colorMode === 'speed') {
-      const gps = currentLog?.messages['GPS'];
-      if (gps && gps.length > 1) {
-        const speeds = gps.map(m => {
-          const spd = m.fields['Spd'];
-          return typeof spd === 'number' ? spd : 0;
-        });
-        const maxSpd = Math.max(...speeds, 1);
-        const colors: string[] = [];
-        for (let i = 0; i < flightPath.length - 1; i++) {
-          const t = (speeds[i] ?? 0) / maxSpd;
-          let r: number, g: number, b: number;
-          if (t < 0.25) { r = 0; g = Math.round(t * 4 * 255); b = 255; }
-          else if (t < 0.5) { r = 0; g = 255; b = Math.round((1 - (t - 0.25) * 4) * 255); }
-          else if (t < 0.75) { r = Math.round((t - 0.5) * 4 * 255); g = 255; b = 0; }
-          else { r = 255; g = Math.round((1 - (t - 0.75) * 4) * 255); b = 0; }
-          colors.push(`#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`);
-        }
-        return colors;
+      const speeds = trackSpeeds(points);
+      const maxSpd = Math.max(...speeds, 1);
+      const colors: string[] = [];
+      for (let i = 0; i < points.length - 1; i++) {
+        colors.push(rampColor((speeds[i] ?? 0) / maxSpd));
       }
+      return colors;
     }
 
     return undefined;
-  }, [flightPath, colorMode, modeTimeline, currentLog, isUlog, flightPathTimes]);
+  }, [points, colorMode, modeTimeline]);
 
   const mapCenter = useMemo((): [number, number] => {
-    if (flightPath.length === 0) return [0, 0];
-    const mid = flightPath[Math.floor(flightPath.length / 2)]!;
-    return [mid[1], mid[0]];
-  }, [flightPath]);
+    if (points.length === 0) return [0, 0];
+    const mid = points[Math.floor(points.length / 2)]!;
+    return [mid.lon, mid.lat];
+  }, [points]);
 
   // Store ground elevation and points for reuse across effects
   const groundElevRef = useRef(0);
+  const terrainListenersRef = useRef<(() => void) | null>(null);
   const pointsRef = useRef<{ lon: number; lat: number; alt: number }[]>([]);
 
-  // Map initialization — only re-runs on flightPath or layer change
+  // Map initialization — only re-runs on the track or layer change
   useEffect(() => {
-    if (!mapContainerRef.current || flightPath.length < 2) return;
+    if (!mapContainerRef.current || points.length < 2) return;
 
     const layerDef = FLIGHT_MAP_LAYERS[activeLayer] ?? FLIGHT_MAP_LAYERS['satellite']!;
 
@@ -1511,7 +1659,7 @@ function FlightPathPanel() {
         data: {
           type: 'Feature',
           properties: {},
-          geometry: { type: 'LineString', coordinates: flightPath.map(([lat, lng]) => [lng, lat]) },
+          geometry: { type: 'LineString', coordinates: points.map((p) => [p.lon, p.lat]) },
         },
       });
       map.addLayer({
@@ -1526,76 +1674,121 @@ function FlightPathPanel() {
       threeLayerRef.current = threeLayer;
       map.addLayer(threeLayer.layer);
 
-      pointsRef.current = flightPath.map(([lat, lng, alt]) => ({ lon: lng, lat, alt }));
-      const startLngLat = new maplibregl.LngLat(flightPath[0]![1], flightPath[0]![0]);
+      pointsRef.current = points.map((p) => ({ lon: p.lon, lat: p.lat, alt: p.altRel }));
+      const startLngLat = new maplibregl.LngLat(points[0]!.lon, points[0]!.lat);
+
+      // Ground level comes from the log first, and only then from the DEM.
+      // queryTerrainElevation returns null until the tile under the takeoff
+      // point has loaded, and the old code took that as 0 and drew the whole
+      // flight at sea level, buried under the hill it was flown on.
+      const loggedGround = groundAmsl(points);
+      groundElevRef.current = loggedGround ?? 0;
 
       function renderPath() {
-        groundElevRef.current = map.queryTerrainElevation(startLngLat) ?? 0;
         threeLayer.updateData({
           points: pointsRef.current,
           groundElevation: groundElevRef.current,
           segmentColors,
         });
       }
+      renderPath();
 
-      // Fit bounds first, then render after terrain settles
-      const bounds = new maplibregl.LngLatBounds();
-      for (const [lat, lng] of flightPath) bounds.extend([lng, lat]);
-      map.fitBounds(bounds, { padding: 80, pitch: 50, duration: 0 });
+      // The DEM is what actually gets drawn and a GPS altitude can sit metres
+      // off it, so seat the path on the terrain once it is genuinely available.
+      // Tiles keep arriving and refining, so this tracks the value until the map
+      // goes idle rather than latching the first coarse parent tile.
+      const adoptTerrainGround = () => {
+        const elev = map.queryTerrainElevation(startLngLat);
+        if (elev == null || !Number.isFinite(elev)) return;
+        if (Math.abs(elev - groundElevRef.current) < 0.25) return;
+        groundElevRef.current = elev;
+        renderPath();
+      };
+      map.on('data', adoptTerrainGround);
+
+      const frame = frameBounds(points, FRAME_MIN_SPAN_M);
+      const bounds = frame
+        ? new maplibregl.LngLatBounds([frame.west, frame.south], [frame.east, frame.north])
+        : (() => {
+            const b = new maplibregl.LngLatBounds();
+            for (const p of points) b.extend([p.lon, p.lat]);
+            return b;
+          })();
+      // maxZoom matters: fitting a few metres of track literally pins the
+      // camera to the ground and the viewpoint ends up inside the terrain.
+      const fitOpts = { padding: 60, pitch: 55, maxZoom: FRAME_MAX_ZOOM } as const;
+      map.fitBounds(bounds, { ...fitOpts, duration: 0 });
 
       // Start/end markers
-      const first = flightPath[0]!;
-      const last = flightPath[flightPath.length - 1]!;
+      const first = points[0]!;
+      const last = points[points.length - 1]!;
       new maplibregl.Marker({ color: '#22c55e', scale: 0.7 })
-        .setLngLat([first[1], first[0]])
+        .setLngLat([first.lon, first.lat])
         .setPopup(new maplibregl.Popup({ offset: 20 }).setText('Takeoff'))
         .addTo(map);
       new maplibregl.Marker({ color: '#ef4444', scale: 0.7 })
-        .setLngLat([last[1], last[0]])
+        .setLngLat([last.lon, last.lat])
         .setPopup(new maplibregl.Popup({ offset: 20 }).setText('Landing'))
         .addTo(map);
 
-      // Wait for terrain to load, then render + re-fit
       map.once('idle', () => {
-        renderPath();
-        map.fitBounds(bounds, { padding: 80, pitch: 50, duration: 500 });
+        adoptTerrainGround();
+        map.off('data', adoptTerrainGround);
+        map.fitBounds(bounds, { ...fitOpts, duration: 500 });
       });
+
+      terrainListenersRef.current = () => { map.off('data', adoptTerrainGround); };
     });
 
     // Chart-hover position marker: hovering any chart walks this dot along
     // the trajectory at the hovered instant, tying "what happened at t" to
     // "where the aircraft was". DOM mutations only - no React state per move.
     const hoverEl = document.createElement('div');
-    hoverEl.style.cssText = [
+    hoverEl.style.cssText = 'position:relative;pointer-events:none';
+    const hoverDot = document.createElement('div');
+    hoverDot.style.cssText = [
       'width:14px', 'height:14px', 'border-radius:50%',
       'background:#3b82f6', 'border:2.5px solid #fff',
       'box-shadow:0 0 8px rgba(59,130,246,0.9)',
-      'pointer-events:none',
     ].join(';');
-    const hoverMarker = new maplibregl.Marker({ element: hoverEl });
+    const hoverLabel = document.createElement('div');
+    hoverLabel.style.cssText = [
+      'position:absolute', 'left:18px', 'top:-4px', 'white-space:pre',
+      'font:11px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace',
+      'padding:3px 6px', 'border-radius:4px',
+      'background:rgba(17,24,39,0.88)', 'color:#e5e7eb',
+      'border:1px solid rgba(255,255,255,0.15)',
+    ].join(';');
+    hoverEl.append(hoverDot, hoverLabel);
+    const hoverMarker = new maplibregl.Marker({ element: hoverEl, anchor: 'center' });
     let hoverShown = false;
+    const hoverSpeeds = trackSpeeds(points);
     const unsubHover = subscribeHoverTime((timeS) => {
-      if (timeS == null || flightTimes.length === 0) {
+      if (timeS == null || points.length === 0) {
         if (hoverShown) { hoverMarker.remove(); hoverShown = false; }
         return;
       }
-      const idx = Math.min(Math.max(lowerBoundIdx(flightTimes, timeS), 0), flightPath.length - 1);
-      const p = flightPath[idx];
+      const idx = trackIndexAtTime(points, timeS);
+      const p = points[idx];
       if (!p) return;
-      hoverMarker.setLngLat([p[1], p[0]]);
+      hoverMarker.setLngLat([p.lon, p.lat]);
+      hoverLabel.textContent =
+        `${p.altRel.toFixed(1)} m  ${(hoverSpeeds[idx] ?? 0).toFixed(1)} m/s\n${p.timeS.toFixed(2)} s`;
       if (!hoverShown) { hoverMarker.addTo(map); hoverShown = true; }
     });
 
     mapRef.current = map;
     return () => {
       unsubHover();
+      terrainListenersRef.current?.();
+      terrainListenersRef.current = null;
       hoverMarker.remove();
       threeLayerRef.current?.dispose();
       threeLayerRef.current = null;
       map.remove();
       mapRef.current = null;
     };
-  }, [flightPath, flightTimes, activeLayer, mapCenter]);
+  }, [points, activeLayer, mapCenter]);
 
   // Update colors without rebuilding the map
   useEffect(() => {
@@ -1607,7 +1800,7 @@ function FlightPathPanel() {
     });
   }, [segmentColors]);
 
-  if (flightPath.length < 2) {
+  if (points.length < 2) {
     return (
       <div className="h-full flex items-center justify-center text-content-tertiary text-xs">
         No GPS data available
@@ -1618,6 +1811,10 @@ function FlightPathPanel() {
   return (
     <div className="h-full relative">
       <div ref={mapContainerRef} className="h-full w-full" />
+      <div className="absolute bottom-2 left-1/2 -translate-x-1/2 z-10 px-2 py-1 rounded-md bg-surface-overlay backdrop-blur-sm text-[10px] text-content-secondary whitespace-nowrap">
+        {`Altitude above takeoff · peak ${trackAltitudeRange(points).max.toFixed(1)} m · ${track.source}`}
+        {track.altitudeBasis === 'derived' && <span className="text-content-tertiary"> (ground level inferred)</span>}
+      </div>
       {/* Controls overlay */}
       <div className="absolute top-2 right-2 z-10 flex flex-col items-stretch gap-1.5">
         {/* Layer switcher */}
@@ -1661,9 +1858,9 @@ function FlightPathPanel() {
       {/* Center on flight path FAB */}
       <button
         onClick={() => {
-          if (!mapRef.current || flightPath.length < 2) return;
-          const lngs = flightPath.map(p => p[1]);
-          const lats = flightPath.map(p => p[0]);
+          if (!mapRef.current || points.length < 2) return;
+          const lngs = points.map((p) => p.lon);
+          const lats = points.map((p) => p.lat);
           mapRef.current.fitBounds(
             [[Math.min(...lngs), Math.min(...lats)], [Math.max(...lngs), Math.max(...lats)]],
             { padding: 80, pitch: 50, duration: 800 },
@@ -2299,7 +2496,12 @@ export function LogExplorerPanel() {
               <div className="grid gap-y-1 text-[11px]" style={{ gridTemplateColumns: 'max-content 1fr', columnGap: '12px' }}>
                 <span className="text-content font-medium">Scroll / pinch</span><span className="text-content-secondary">zoom time, anchored at cursor</span>
                 <span className="text-content font-medium">Two-finger swipe</span><span className="text-content-secondary">pan time (horizontal)</span>
-                <span className="text-content font-medium">Shift + scroll</span><span className="text-content-secondary">zoom values (Y)</span>
+                <span className="text-content font-medium">Scroll over an axis</span><span className="text-content-secondary">zoom that axis alone</span>
+                <span className="text-content font-medium">Drag an axis</span><span className="text-content-secondary">pan that axis</span>
+                <span className="text-content font-medium">Double-click an axis</span><span className="text-content-secondary">that axis back to auto-fit</span>
+                <span className="text-content font-medium">Shift + scroll</span><span className="text-content-secondary">zoom values (Y) on the selected axis, else all</span>
+                <span className="text-content font-medium">Click a legend row</span><span className="text-content-secondary">aim shift+scroll at that one axis</span>
+                <span className="text-content font-medium">Legend min / max</span><span className="text-content-secondary">type an exact range for that axis</span>
                 <span className="text-content font-medium">Drag</span><span className="text-content-secondary">{explorerTool === 'zoom' ? 'box zoom (Zoom tool)' : 'pan the view (Pan tool)'}</span>
                 <span className="text-content font-medium">Right-drag</span><span className="text-content-secondary">pan (mouse)</span>
                 <span className="text-content font-medium">Double-click</span><span className="text-content-secondary">reset both axes</span>

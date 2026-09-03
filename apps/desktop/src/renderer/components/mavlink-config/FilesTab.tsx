@@ -17,6 +17,7 @@ import {
   Folder,
   File,
   ChevronRight,
+  HardDrive,
   Home,
   RefreshCw,
   Download,
@@ -57,6 +58,11 @@ export const FilesTab: React.FC = () => {
   // Modal state for delete confirmation and rename input.
   const [confirmDelete, setConfirmDelete] = useState<DirEntry | null>(null);
   const [renameTarget, setRenameTarget] = useState<DirEntry | null>(null);
+  const [storageInfo, setStorageInfo] =
+    useState<{ totalBytes: number; usedBytes: number; availableBytes: number } | null>(null);
+  const [eraseLogsOpen, setEraseLogsOpen] = useState(false);
+  const [erasingLogs, setErasingLogs] = useState(false);
+  const [eraseLogsDone, setEraseLogsDone] = useState(false);
 
   const refresh = useCallback(async (target: string) => {
     setLoading(true);
@@ -80,6 +86,32 @@ export const FilesTab: React.FC = () => {
       void refresh(path);
     }
   }, [isConnected, protocol, path, refresh]);
+
+  const refreshStorageInfo = useCallback(() => {
+    window.electronAPI.logStorageInfo().then(setStorageInfo).catch(() => setStorageInfo(null));
+  }, []);
+
+  useEffect(() => {
+    if (isConnected && protocol === 'mavlink') refreshStorageInfo();
+    else setStorageInfo(null);
+  }, [isConnected, protocol, refreshStorageInfo]);
+
+  const handleEraseLogs = useCallback(async () => {
+    setEraseLogsOpen(false);
+    setErasingLogs(true);
+    setEraseLogsDone(false);
+    try {
+      const sent = await window.electronAPI.logEraseAll();
+      if (!sent) return;
+      // LOG_ERASE has no ack; give the FC a moment before re-reading state.
+      await new Promise((r) => setTimeout(r, 1500));
+      refreshStorageInfo();
+      void refresh(path);
+      setEraseLogsDone(true);
+    } finally {
+      setErasingLogs(false);
+    }
+  }, [path, refresh, refreshStorageInfo]);
 
   const fcPathFor = useCallback((entry: DirEntry) =>
     path.endsWith('/') ? `${path}${entry.name}` : `${path}/${entry.name}`,
@@ -200,6 +232,13 @@ export const FilesTab: React.FC = () => {
         </div>
       )}
 
+      <SdStorageCard
+        storageInfo={storageInfo}
+        erasing={erasingLogs}
+        eraseDone={eraseLogsDone}
+        onEraseLogs={() => setEraseLogsOpen(true)}
+      />
+
       <PathBar
         path={path}
         loading={loading}
@@ -294,6 +333,13 @@ export const FilesTab: React.FC = () => {
           entry={renameTarget}
           onCancel={() => setRenameTarget(null)}
           onSubmit={handleRenameSubmit}
+        />
+      )}
+
+      {eraseLogsOpen && (
+        <ConfirmEraseLogsModal
+          onCancel={() => setEraseLogsOpen(false)}
+          onConfirm={handleEraseLogs}
         />
       )}
     </ChromedShell>
@@ -485,6 +531,102 @@ function IconAction({
   );
 }
 
+function SdStorageCard({
+  storageInfo,
+  erasing,
+  eraseDone,
+  onEraseLogs,
+}: {
+  storageInfo: { totalBytes: number; usedBytes: number; availableBytes: number } | null;
+  erasing: boolean;
+  eraseDone: boolean;
+  onEraseLogs: () => void;
+}) {
+  const hasInfo = storageInfo !== null && storageInfo.totalBytes > 0;
+  const pct = hasInfo ? Math.min(100, (storageInfo.usedBytes / storageInfo.totalBytes) * 100) : 0;
+  const barColor = pct >= 90 ? 'bg-red-500' : pct >= 75 ? 'bg-amber-500' : 'bg-blue-500';
+  const low = hasInfo && pct >= 90;
+
+  return (
+    <div className="flex-shrink-0 px-4 py-3 rounded-lg bg-surface border border-subtle">
+      <div className="flex items-center gap-4">
+        <HardDrive className="w-4 h-4 text-content-secondary flex-shrink-0" />
+        <div className="flex-1 min-w-0">
+          {hasInfo ? (
+            <>
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-xs text-content-secondary">
+                  SD card: <span className="text-content font-medium">{formatSize(storageInfo.usedBytes)}</span>{' '}
+                  of {formatSize(storageInfo.totalBytes)} used
+                </span>
+                <span className={`text-xs font-medium ${low ? 'text-red-400' : 'text-content-secondary'}`}>
+                  {formatSize(storageInfo.availableBytes)} free
+                </span>
+              </div>
+              <div className="w-full bg-surface-inset rounded-full h-1.5">
+                <div className={`${barColor} h-1.5 rounded-full transition-all`} style={{ width: `${pct}%` }} />
+              </div>
+              {low && (
+                <p className="text-[11px] text-red-400 mt-1.5">
+                  Logging stops mid-flight when free space runs out. Erase old logs before flying.
+                </p>
+              )}
+            </>
+          ) : (
+            <span className="text-xs text-content-tertiary">
+              SD card capacity not reported by this firmware
+            </span>
+          )}
+        </div>
+        <button
+          onClick={onEraseLogs}
+          disabled={erasing}
+          data-tip="Erase all flight logs on the SD card"
+          className="flex-shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded text-xs text-rose-400 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 disabled:opacity-50 transition-colors"
+        >
+          <Trash2 className="w-3.5 h-3.5" />
+          {erasing ? 'Erasing...' : eraseDone ? 'Logs erased' : 'Erase flight logs'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ConfirmEraseLogsModal({
+  onCancel,
+  onConfirm,
+}: {
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <ModalShell onCancel={onCancel}>
+      <div className="text-content font-medium mb-1">Erase all flight logs?</div>
+      <div className="text-xs text-content-secondary mb-4">
+        Every flight log on the flight controller's SD card will be permanently deleted.
+        Logs that were never downloaded cannot be recovered.
+        <span className="block mt-1 text-amber-400">
+          Download anything you still need before erasing.
+        </span>
+      </div>
+      <div className="flex justify-end gap-2">
+        <button
+          onClick={onCancel}
+          className="px-3 py-1.5 rounded text-xs text-content hover:bg-surface-raised"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={onConfirm}
+          className="px-3 py-1.5 rounded text-xs bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/30"
+        >
+          Erase all logs
+        </button>
+      </div>
+    </ModalShell>
+  );
+}
+
 function ConfirmDeleteModal({
   entry,
   onCancel,
@@ -587,5 +729,6 @@ function ModalShell({ children, onCancel }: { children: React.ReactNode; onCance
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }

@@ -81,6 +81,20 @@ export function padRange(st: FieldStats | null): [number, number] {
 }
 
 /**
+ * A typed Y-axis range, or null when it should be ignored. An inverted or
+ * degenerate range renders an empty plot, so a bad entry leaves the axis on
+ * whatever it already had rather than blanking the chart.
+ */
+export function parseAxisRange(minText: string, maxText: string): { min: number; max: number } | null {
+  const min = Number(minText.trim());
+  const max = Number(maxText.trim());
+  if (minText.trim() === '' || maxText.trim() === '') return null;
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return null;
+  if (min >= max) return null;
+  return { min, max };
+}
+
+/**
  * CSV of chart columns over an inclusive index window. First column is time,
  * NaN cells (union-time gaps between different sample rates) become empty.
  */

@@ -3,12 +3,16 @@
  * with drop lines to ground. Based on mission-threejs-layer.ts pattern.
  */
 import * as THREE from 'three';
+import { Line2 } from 'three/examples/jsm/lines/Line2.js';
+import { LineGeometry } from 'three/examples/jsm/lines/LineGeometry.js';
+import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
 import maplibregl, { type CustomLayerInterface, type CustomRenderMethodInput } from 'maplibre-gl';
 
 export interface FlightPathPoint {
   lon: number;
   lat: number;
-  alt: number; // meters AGL
+  /** Metres above the takeoff point, NOT AMSL: the layer adds terrain itself. */
+  alt: number;
 }
 
 export interface FlightPathLayerData {
@@ -16,6 +20,7 @@ export interface FlightPathLayerData {
   /** Ground elevation MSL at the takeoff point. Added to all altitudes so path sits above terrain. */
   groundElevation?: number;
   terrainExaggeration?: number;
+
   /** Per-segment hex color (length = points.length - 1). If omitted, uses default amber. */
   segmentColors?: string[];
 }
@@ -26,12 +31,19 @@ export interface FlightPathThreeJsLayer {
   dispose: () => void;
 }
 
-const PATH_WIDTH = 6;
-const PATH_COLOR = 0xf59e0b;    // amber
-const PATH_OPACITY = 0.9;
+/**
+ * Line width in SCREEN PIXELS. A world-space ribbon or tube has to guess a
+ * thickness in metres, which reads as a hairline on a long flight and as a
+ * sausage on a short one; a screen-space line is the same weight at any zoom.
+ */
+const PATH_WIDTH_PX = 3.5;
+const DEFAULT_PATH_HEX = '#f59e0b'; // amber
 const DROP_LINE_COLOR = 0xf59e0b; // amber, matching path
-const DROP_LINE_OPACITY = 0.7;
-const DROP_LINE_STEP = 15; // every N points
+const DROP_LINE_OPACITY = 0.55;
+/** Drop lines are spaced to land ~40 across the track whatever its length. */
+const DROP_LINE_TARGET = 40;
+/** Drop lines start once the track is clear of the ground by this much. */
+const DROP_LINE_MIN_HEIGHT_M = 0.5;
 
 export function createFlightPathThreeJsLayer(): FlightPathThreeJsLayer {
   let map: maplibregl.Map | null = null;
@@ -42,16 +54,20 @@ export function createFlightPathThreeJsLayer(): FlightPathThreeJsLayer {
   let modelTransform = { translateX: 0, translateY: 0, translateZ: 0, scale: 1 };
   const rotationX = new THREE.Matrix4().makeRotationAxis(new THREE.Vector3(1, 0, 0), Math.PI / 2);
 
-  const meshes: { mesh: THREE.Mesh; geometry: THREE.BufferGeometry; material: THREE.MeshBasicMaterial }[] = [];
+  let pathLine: Line2 | null = null;
+  let pathGeometry: LineGeometry | null = null;
+  let pathMaterial: LineMaterial | null = null;
   let dropLinesObj: THREE.LineSegments | null = null;
 
   function clearScene() {
-    for (const m of meshes) {
-      scene.remove(m.mesh);
-      m.geometry.dispose();
-      m.material.dispose();
+    if (pathLine) {
+      scene.remove(pathLine);
+      pathGeometry?.dispose();
+      pathMaterial?.dispose();
+      pathLine = null;
+      pathGeometry = null;
+      pathMaterial = null;
     }
-    meshes.length = 0;
     if (dropLinesObj) {
       scene.remove(dropLinesObj);
       dropLinesObj.geometry.dispose();
@@ -88,67 +104,60 @@ export function createFlightPathThreeJsLayer(): FlightPathThreeJsLayer {
       };
     });
 
-    // Flight path ribbon — cross-shaped (visible from any angle)
-    const hw = PATH_WIDTH / 2;
-    for (let i = 0; i < local.length - 1; i++) {
-      const from = local[i]!;
-      const to = local[i + 1]!;
+    // One screen-space polyline through every point. Width is in pixels, so it
+    // looks like a line at any zoom instead of a hairline or a solid tube.
+    {
+      const positions: number[] = [];
+      const colors: number[] = [];
+      const colorCache = new Map<string, THREE.Color>();
+      const segColor = (i: number): THREE.Color => {
+        const hex = segmentColors?.[Math.min(i, (segmentColors?.length ?? 1) - 1)] ?? DEFAULT_PATH_HEX;
+        let c = colorCache.get(hex);
+        if (!c) { c = new THREE.Color(hex); colorCache.set(hex, c); }
+        return c;
+      };
 
-      const dx = to.x - from.x;
-      const dz = to.z - from.z;
-      const lenXZ = Math.sqrt(dx * dx + dz * dz);
-      let hpx: number, hpz: number;
-      if (lenXZ > 0.001) { hpx = (-dz / lenXZ) * hw; hpz = (dx / lenXZ) * hw; }
-      else { hpx = hw; hpz = 0; }
+      for (let i = 0; i < local.length; i++) {
+        const p = local[i]!;
+        positions.push(p.x, p.y, p.z);
+        // segmentColors is per segment; a vertex takes the colour of the
+        // segment leaving it, so a mode change blends across one segment.
+        const c = segColor(Math.min(i, local.length - 2));
+        colors.push(c.r, c.g, c.b);
+      }
 
-      const positions = new Float32Array([
-        // Horizontal ribbon
-        from.x - hpx, from.y, from.z - hpz,
-        from.x + hpx, from.y, from.z + hpz,
-        to.x + hpx, to.y, to.z + hpz,
-        from.x - hpx, from.y, from.z - hpz,
-        to.x + hpx, to.y, to.z + hpz,
-        to.x - hpx, to.y, to.z - hpz,
-        // Vertical ribbon
-        from.x, from.y - hw, from.z,
-        from.x, from.y + hw, from.z,
-        to.x, to.y + hw, to.z,
-        from.x, from.y - hw, from.z,
-        to.x, to.y + hw, to.z,
-        to.x, to.y - hw, to.z,
-      ]);
+      pathGeometry = new LineGeometry();
+      pathGeometry.setPositions(positions);
+      pathGeometry.setColors(colors);
 
-      const geometry = new THREE.BufferGeometry();
-      geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-
-      const segColor = segmentColors?.[i] ?? '#f59e0b';
-      const material = new THREE.MeshBasicMaterial({
-        color: new THREE.Color(segColor),
-        side: THREE.DoubleSide,
-        transparent: true,
-        opacity: PATH_OPACITY,
-        depthWrite: false,
+      pathMaterial = new LineMaterial({
+        linewidth: PATH_WIDTH_PX,
+        vertexColors: true,
+        // Pixel widths, not metres. resolution is refreshed every frame in
+        // render() because the canvas can resize under us.
+        worldUnits: false,
+        dashed: false,
       });
 
-      const mesh = new THREE.Mesh(geometry, material);
-      mesh.frustumCulled = false;
-      scene.add(mesh);
-      meshes.push({ mesh, geometry, material });
+      pathLine = new Line2(pathGeometry, pathMaterial);
+      pathLine.frustumCulled = false;
+      scene.add(pathLine);
     }
 
     // Drop lines — every N points
     {
       const positions: number[] = [];
-      for (let i = 0; i < local.length; i += DROP_LINE_STEP) {
+      const step = Math.max(1, Math.round(local.length / DROP_LINE_TARGET));
+      for (let i = 0; i < local.length; i += step) {
         const p = local[i]!;
-        if (p.y > p.groundY + 1) {
+        if (p.y > p.groundY + DROP_LINE_MIN_HEIGHT_M) {
           positions.push(p.x, p.y, p.z);
           positions.push(p.x, p.groundY, p.z);
         }
       }
       // Always include last point
       const last = local[local.length - 1]!;
-      if (last.y > last.groundY + 1) {
+      if (last.y > last.groundY + DROP_LINE_MIN_HEIGHT_M) {
         positions.push(last.x, last.y, last.z);
         positions.push(last.x, last.groundY, last.z);
       }
@@ -195,6 +204,17 @@ export function createFlightPathThreeJsLayer(): FlightPathThreeJsLayer {
 
       const m = new THREE.Matrix4().fromArray(args.defaultProjectionData.mainMatrix as number[]);
       camera.projectionMatrix = m.multiply(l);
+
+      if (pathMaterial) {
+        // CSS pixels, not drawing-buffer pixels: LineMaterial divides the width
+        // by resolution, so passing device pixels halves the line on a retina
+        // display. clientWidth is 0 in a detached canvas, hence the fallback.
+        const canvas = map.getCanvas();
+        pathMaterial.resolution.set(
+          canvas.clientWidth || canvas.width,
+          canvas.clientHeight || canvas.height,
+        );
+      }
 
       renderer.resetState();
       renderer.render(scene, camera);
