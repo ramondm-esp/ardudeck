@@ -33,6 +33,32 @@ const LAMBDA_SEP: f64 = -0.09;
 /// Turbulent separation, by shape factor.
 const H_SEP: f64 = 2.4;
 
+/// Momentum-thickness Reynolds number below which a laminar separation bubble
+/// BURSTS instead of reattaching (Owen and Klanfer). This is the mechanism of
+/// LEADING-EDGE stall: a sharp nose separates the flow within a few thousandths
+/// of a chord, where the layer is too thin to survive the pressure recovery, so
+/// it never comes back. A blunt nose separates later with a fatter layer and
+/// reattaches, which is why it stalls gently from the trailing edge instead.
+const RE_THETA_BURST: f64 = 125.0;
+
+/// Normal-force coefficient of a fully separated flat plate, which is what a
+/// section becomes once its leading-edge bubble has burst.
+const CD_PLATE: f64 = 1.15;
+
+/// Suction peaks between which leading-edge stall sets in.
+///
+/// The peak is the criterion, not a symptom. Thin airfoil theory gives an
+/// INFINITE suction peak at a sharp leading edge, and a real nose of finite
+/// radius gives a large finite one; no boundary layer survives recovering from
+/// it, and that is what leading-edge stall is.
+///
+/// Judging it by Reynolds number at separation goes the wrong way: the peak
+/// inflates the local velocity, so `Re_theta` RISES with incidence and the
+/// criterion relaxed exactly when it should have bitten. A NACA 0004 reached
+/// Cp of -96 at 16 degrees and -147 at 20 and was still counted half attached.
+const CP_PEAK_OK: f64 = -6.0;
+const CP_PEAK_GONE: f64 = -14.0;
+
 /// Separation reaching this far forward counts as stalled.
 ///
 /// A CALIBRATION of this closure, not a physical constant, and the one number
@@ -64,6 +90,14 @@ pub struct SurfaceBl {
     pub x_sep: f64,
     /// Where it transitioned, as x/c. 1.0 means it stayed laminar.
     pub x_tr: f64,
+    /// How completely the leading-edge bubble failed to reattach: 0 fully
+    /// reattached, 1 fully burst.
+    ///
+    /// A FRACTION and not a flag. A boolean flips with angle of attack as the
+    /// separation and transition points hop between panels, which puts a step in
+    /// the polar, and a step in a coefficient table is the same defect that once
+    /// gave an article a hole to fly through.
+    pub burst: f64,
 }
 
 /// A section's viscous state at one angle of attack.
@@ -106,6 +140,7 @@ fn march(s: &[f64], ue: &[f64], x: &[f64], re: f64) -> SurfaceBl {
         ue_te: te_ref,
         x_sep: 1.0,
         x_tr: 1.0,
+        burst: 0.0,
     };
     if n < 4 {
         return out;
@@ -161,19 +196,17 @@ fn march(s: &[f64], ue: &[f64], x: &[f64], re: f64) -> SurfaceBl {
     // coefficient of 2.0 to 2.5 where a NACA 0004 at Re 2e5 measures nearer 0.8.
     // The panel solve had the suction peak right the whole time; nothing was
     // acting on it.
-    // TRIED AND REVERTED: Owen and Klanfer's bubble-burst criterion, which says
-    // a laminar separation bubble reattaches only above a momentum-thickness
-    // Reynolds number of about 125. It is the right mechanism for leading-edge
-    // stall and it is why a thin sharp-nosed section lets go early.
-    //
-    // It cannot be applied to this boundary layer as it stands. On a sharp
-    // section the laminar separation lands at x/c of 0.002, where theta is
-    // genuinely tiny and Re_theta is genuinely below 125 at every incidence, so
-    // the criterion fires at four degrees and the section never flies at all.
-    // Judging a bubble needs it resolved over its own length, which needs the
-    // finer near-nose treatment XFOIL gets from its lagged-dissipation
-    // formulation. Left here as a signpost rather than a broken switch.
     if laminar_sep {
+        let u_sep = ue[i_tr.min(n - 1)].abs().max(1e-6);
+        let re_theta = u_sep * theta / nu;
+        // Smoothstepped across the threshold rather than switched at it.
+        let t = (1.0 - re_theta / RE_THETA_BURST).clamp(0.0, 1.0);
+        out.burst = t * t * (3.0 - 2.0 * t);
+        if out.burst > 0.99 {
+            out.theta_te = theta;
+            out.h_te = h.max(H_SEP);
+            return out;
+        }
         out.x_tr = out.x_sep;
         out.x_sep = 1.0;
     }
@@ -270,8 +303,8 @@ pub fn viscous_point(section: &Section, alpha: f64, re: f64) -> ViscousPoint {
         cl: inv.cl,
         cd: 0.0,
         cm: inv.cm,
-        upper: SurfaceBl { theta_te: 0.0, h_te: 2.6, ue_te: 1.0, x_sep: 1.0, x_tr: 1.0 },
-        lower: SurfaceBl { theta_te: 0.0, h_te: 2.6, ue_te: 1.0, x_sep: 1.0, x_tr: 1.0 },
+        upper: SurfaceBl { theta_te: 0.0, h_te: 2.6, ue_te: 1.0, x_sep: 1.0, x_tr: 1.0, burst: 0.0 },
+        lower: SurfaceBl { theta_te: 0.0, h_te: 2.6, ue_te: 1.0, x_sep: 1.0, x_tr: 1.0, burst: 0.0 },
         stalled: false,
     };
     if n < 8 {
@@ -307,14 +340,48 @@ pub fn viscous_point(section: &Section, alpha: f64, re: f64) -> ViscousPoint {
     let sq = |b: &SurfaceBl| 2.0 * b.theta_te * b.ue_te.powf((b.h_te + 5.0) / 2.0);
     vp.cd = sq(&vp.upper) + sq(&vp.lower);
 
-    // Stall: separation has run forward past most of the chord. Lift is then cut
-    // by how much of the surface is still attached, which is crude but is a
-    // consequence of the separation point rather than a stall angle typed in.
+    // ── LEADING-EDGE STALL ─────────────────────────────────────────────────
+    //
+    // The bubble burst, so the flow is separated from the nose back. The section
+    // is now a FLAT PLATE at this angle, and that is what it gets: the fully
+    // separated normal-force law, not a fraction of the attached lift.
+    //
+    // Cutting lift toward zero instead was the mistake that made this criterion
+    // look wrong the first time it was tried. It stalled a NACA 0004 at four
+    // degrees down to CL 0.001, which is not what a stalled section does: a
+    // stalled plate still carries a normal force of about `cd_max sin(alpha)`,
+    // which is where its remaining lift comes from. The criterion was firing
+    // correctly all along; what followed it was wrong.
+    // Leading-edge stall from the SUCTION PEAK the panel solve computed, blended
+    // with the bubble-burst estimate from the boundary layer. Either mechanism
+    // can take a section; the peak is what takes a thin one.
+    let peak = ((inv.cp_min - CP_PEAK_OK) / (CP_PEAK_GONE - CP_PEAK_OK)).clamp(0.0, 1.0);
+    let peak = peak * peak * (3.0 - 2.0 * peak);
+    let burst = vp.upper.burst.max(vp.lower.burst).max(peak);
+    if burst > 0.01 {
+        let a = alpha.abs();
+        let cn = CD_PLATE * a.sin();
+        let (pl_cl, pl_cd, pl_cm) = (
+            cn * a.cos() * alpha.signum(),
+            cn * a.sin() + vp.cd.min(0.05),
+            -0.25 * cn,
+        );
+        vp.cl = vp.cl * (1.0 - burst) + pl_cl * burst;
+        vp.cd = vp.cd * (1.0 - burst) + pl_cd * burst;
+        vp.cm = vp.cm * (1.0 - burst) + pl_cm * burst;
+        if burst > 0.5 {
+            vp.stalled = true;
+            return vp;
+        }
+    }
+
+    // ── TRAILING-EDGE STALL ────────────────────────────────────────────────
+    // Separation has crept forward over most of the chord. Lift falls off as the
+    // attached fraction shrinks, which is the gentle stall a thick section has.
     let sep = vp.upper.x_sep.min(1.0);
     if sep < STALL_SEP_X {
         vp.stalled = true;
         vp.cl = inv.cl * (sep / STALL_SEP_X).clamp(0.0, 1.0);
-        // Separated flow is bluff: pressure drag on top of the profile drag.
         vp.cd += 0.9 * (1.0 - sep) * inv.cl.abs().max(0.3);
     }
     vp
@@ -490,4 +557,8 @@ mod bake_cost {
         assert!(p.len() > 50);
     }
 }
+
+
+
+
 

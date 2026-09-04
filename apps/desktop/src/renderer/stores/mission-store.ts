@@ -453,6 +453,56 @@ interface MissionStore {
   redo: () => void;
 }
 
+// With a distribution, fresh survey items re-split into the recorded chunk groups.
+function applySurveyItems(
+  state: { groups: Group[]; missionItems: MissionItem[] },
+  updatedGroup: SurveyGroup,
+  freshItems: MissionItem[],
+): { groups: Group[]; missionItems: MissionItem[] } {
+  const dist = updatedGroup.distribution;
+  const childIds = new Set(dist?.chunks.map((c) => c.groupId) ?? []);
+  const others = state.missionItems.filter(
+    (it) => it.groupId !== updatedGroup.id && !(it.groupId && childIds.has(it.groupId)),
+  );
+  let groups = state.groups.map((g) => (g.id === updatedGroup.id ? (updatedGroup as Group) : g));
+
+  if (dist && dist.chunks.length >= 2) {
+    const chunks = splitMissionForFleet(freshItems, dist.chunks.length);
+    if (chunks.length === dist.chunks.length) {
+      const now = Date.now();
+      let seq = others.length;
+      let order = groups.reduce((m, g) => Math.max(m, g.order), -1);
+      const newItems: MissionItem[] = [];
+      for (let i = 0; i < dist.chunks.length; i++) {
+        const c = dist.chunks[i]!;
+        if (groups.some((g) => g.id === c.groupId)) {
+          groups = groups.map((g) => (g.id === c.groupId ? { ...g, updatedAt: now } : g));
+        } else {
+          order += 1;
+          groups = [
+            ...groups,
+            {
+              ...createManualGroup({
+                name: `${updatedGroup.name} ${i + 1}/${dist.chunks.length} - ${c.label}`,
+                color: c.color,
+              }),
+              id: c.groupId,
+              order,
+              assignedVehicleKey: c.vehicleKey,
+            } as Group,
+          ];
+        }
+        for (const it of chunks[i]!) newItems.push({ ...it, seq: seq++, groupId: c.groupId });
+      }
+      return { groups, missionItems: [...others, ...newItems] };
+    }
+  }
+
+  const startSeq = others.length;
+  const stamped = freshItems.map((it, i) => ({ ...it, seq: startSeq + i, groupId: updatedGroup.id }));
+  return { groups, missionItems: [...others, ...stamped] };
+}
+
 export const useMissionStore = create<MissionStore>((set, get) => ({
   // Initial state
   missionItems: [],
@@ -1077,7 +1127,20 @@ export const useMissionStore = create<MissionStore>((set, get) => ({
     set((s) => {
       const remainingItems = s.missionItems.filter((it) => it.groupId !== groupId);
       const renumbered = remainingItems.map((it, idx) => ({ ...it, seq: idx }));
-      const remainingGroups = s.groups.filter((g) => g.id !== groupId);
+      // Below 2 chunks a distribution is meaningless and clears entirely.
+      const remainingGroups = s.groups
+        .filter((g) => g.id !== groupId)
+        .map((g) => {
+          if (g.kind !== 'survey') return g;
+          const sg = g as SurveyGroup;
+          if (!sg.distribution?.chunks.some((c) => c.groupId === groupId)) return g;
+          const chunks = sg.distribution.chunks.filter((c) => c.groupId !== groupId);
+          return {
+            ...sg,
+            distribution: chunks.length >= 2 ? { chunks } : undefined,
+            updatedAt: Date.now(),
+          } as Group;
+        });
       // Selection cleanup: if the selected WP was in the deleted group,
       // clear it. Otherwise re-resolve its seq after renumbering.
       let nextSelected: number | null = s.selectedSeq;
@@ -1181,7 +1244,27 @@ export const useMissionStore = create<MissionStore>((set, get) => ({
       const group = createManualGroup({ name: `${source.name} ${i + 1}/${vehicles.length} - ${v.label}`, color: v.color });
       return { group: { ...group, assignedVehicleKey: v.key } as Group, items: chunk };
     });
-    get().deleteGroup(groupId);
+    if (source.kind === 'survey') {
+      const distribution = {
+        chunks: entries.map((e, i) => ({
+          groupId: e.group.id,
+          vehicleKey: vehicles[i]!.key,
+          label: vehicles[i]!.label,
+          color: vehicles[i]!.color,
+        })),
+      };
+      set({
+        missionItems: get().missionItems.filter((it) => it.groupId !== groupId),
+        groups: get().groups.map((g) =>
+          g.id === groupId
+            ? ({ ...g, collapsed: true, distribution, updatedAt: Date.now() } as Group)
+            : g,
+        ),
+        isDirty: true,
+      });
+    } else {
+      get().deleteGroup(groupId);
+    }
     return get().addGroupsWithItems(entries);
   },
 
@@ -1189,17 +1272,6 @@ export const useMissionStore = create<MissionStore>((set, get) => ({
     const { missionItems, groups } = get();
     const group = groups.find((g) => g.id === groupId);
     if (!group || group.kind !== 'survey') return;
-    // Drop existing items belonging to this group, keep everything else in
-    // its current relative order, then append the freshly generated items.
-    // PR 8 may revisit positioning to keep the survey "in place" rather
-    // than rebuild-at-end semantics; for now appending is the safe default.
-    const others = missionItems.filter((it) => it.groupId !== groupId);
-    const startSeq = others.length;
-    const stampedItems = items.map((it, i) => ({
-      ...it,
-      seq: startSeq + i,
-      groupId,
-    }));
     const updatedGroup: SurveyGroup = {
       ...(group as SurveyGroup),
       lastGeneratedAt: Date.now(),
@@ -1208,24 +1280,13 @@ export const useMissionStore = create<MissionStore>((set, get) => ({
       ...(generatorResult !== undefined ? { generatorResult } : {}),
       updatedAt: Date.now(),
     };
-    set({
-      groups: groups.map((g) => (g.id === groupId ? updatedGroup : g)),
-      missionItems: [...others, ...stampedItems],
-      isDirty: true,
-    });
+    set({ ...applySurveyItems({ groups, missionItems }, updatedGroup, items), isDirty: true });
   },
 
   syncSurveyGroupFromDraft: (groupId, polygon, config, items, signature, generatorResult) => {
     const { missionItems, groups } = get();
     const group = groups.find((g) => g.id === groupId);
     if (!group || group.kind !== 'survey') return;
-    const others = missionItems.filter((it) => it.groupId !== groupId);
-    const startSeq = others.length;
-    const stampedItems = items.map((it, i) => ({
-      ...it,
-      seq: startSeq + i,
-      groupId,
-    }));
     const updatedGroup: SurveyGroup = {
       ...(group as SurveyGroup),
       polygon,
@@ -1236,11 +1297,7 @@ export const useMissionStore = create<MissionStore>((set, get) => ({
       ...(generatorResult !== undefined ? { generatorResult } : {}),
       updatedAt: Date.now(),
     };
-    set({
-      groups: groups.map((g) => (g.id === groupId ? updatedGroup : g)),
-      missionItems: [...others, ...stampedItems],
-      isDirty: true,
-    });
+    set({ ...applySurveyItems({ groups, missionItems }, updatedGroup, items), isDirty: true });
   },
 
   // UI state

@@ -9,6 +9,7 @@
 
 import { useState } from 'react';
 import { useFormationControl } from '../../hooks/useFormationControl';
+import { useOrchestrationStore } from '../../stores/orchestration-store';
 import { useMissionStore } from '../../stores/mission-store';
 import { isAssignedToVehicle } from '../../../shared/mission-group-types';
 import { useFleetUiStore, isFleetExpanded } from '../../stores/fleet-ui-store';
@@ -27,6 +28,11 @@ export function FleetCoordination() {
   const assignedCount = vehicles.filter((v) =>
     missionGroups.some((g) => isAssignedToVehicle(g.assignedVehicleKey, v)),
   ).length;
+  const lastControl = useOrchestrationStore((s) => {
+    for (const srv of Object.values(s.servers)) if (srv.lastControl) return srv.lastControl;
+    return null;
+  });
+  const controlIsError = lastControl?.type === 'error' || lastControl?.state === 'failed';
 
   if (!hasServer || vehicles.length === 0) return null;
   if (!canTakeoff && !canFollow) return null;
@@ -63,6 +69,22 @@ export function FleetCoordination() {
               className="w-11 px-1 py-1 text-[11px] text-center rounded bg-surface-input border border-subtle text-content"
             />
           </label>
+        </div>
+      )}
+
+      {lastControl && (
+        <div
+          className={`px-1.5 py-1 rounded text-[10px] font-mono leading-snug break-words ${
+            controlIsError
+              ? 'bg-red-500/10 text-red-400'
+              : lastControl.state === 'done'
+                ? 'text-content-tertiary'
+                : 'text-cyan-500'
+          }`}
+          data-tip="Latest report from the coordination engine (group takeoff / mission start)"
+        >
+          {controlIsError ? 'engine error' : lastControl.state ?? lastControl.type}
+          {lastControl.message ? `: ${lastControl.message}` : ''}
         </div>
       )}
 

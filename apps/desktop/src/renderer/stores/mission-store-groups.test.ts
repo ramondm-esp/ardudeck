@@ -200,3 +200,71 @@ describe('mission-store groups', () => {
     expect(state.groups.find((g) => g.id === survey.id)).toBeTruthy();
   });
 });
+
+describe('distributed survey reacts to regeneration', () => {
+  const VEHICLES = [
+    { key: 't1:2.1', label: 'SYS 2', color: '#f00' },
+    { key: 't1:3.1', label: 'SYS 3', color: '#0f0' },
+  ];
+
+  function wpAt(seq: number, lat: number): MissionItem {
+    return { ...wp(seq), latitude: lat };
+  }
+
+  function makeDistributedSurvey() {
+    const survey = createSurveyGroup({
+      name: 'Field',
+      generatorId: 'builtin.grid',
+      generatorVersion: '1.0.0',
+      polygon: [
+        { lat: 0, lng: 0 },
+        { lat: 1, lng: 0 },
+        { lat: 1, lng: 1 },
+      ],
+      config: { altitude: 50 },
+    });
+    useMissionStore
+      .getState()
+      .addSurveyGroup(survey, Array.from({ length: 8 }, (_, i) => wpAt(i, 50 + i * 0.001)));
+    const ids = useMissionStore.getState().distributeGroupAcrossFleet(survey.id, VEHICLES);
+    return { survey, chunkIds: ids! };
+  }
+
+  beforeEach(() => {
+    useMissionStore.getState().reset();
+  });
+
+  it('distribute keeps the survey group with polygon and records the distribution', () => {
+    const { survey } = makeDistributedSurvey();
+    const stored = useMissionStore.getState().groups.find((g) => g.id === survey.id);
+    expect(stored?.kind).toBe('survey');
+    if (stored?.kind !== 'survey') throw new Error();
+    expect(stored.polygon).toHaveLength(3);
+    expect(stored.distribution?.chunks).toHaveLength(2);
+    expect(useMissionStore.getState().missionItems.filter((it) => it.groupId === survey.id)).toHaveLength(0);
+  });
+
+  it('regenerating re-splits fresh items into the SAME chunk groups', () => {
+    const { survey, chunkIds } = makeDistributedSurvey();
+    const fresh = Array.from({ length: 10 }, (_, i) => wpAt(i, 60 + i * 0.001));
+    useMissionStore.getState().replaceSurveyGroupItems(survey.id, fresh, 'sig2');
+
+    const s = useMissionStore.getState();
+    expect(s.missionItems.filter((it) => it.groupId === survey.id)).toHaveLength(0);
+    const chunk0 = s.missionItems.filter((it) => it.groupId === chunkIds[0]);
+    const chunk1 = s.missionItems.filter((it) => it.groupId === chunkIds[1]);
+    expect(chunk0.length + chunk1.length).toBe(10);
+    expect(chunk0.every((it) => it.latitude >= 60)).toBe(true);
+    // Same group ids -> vehicle assignments and colors survived.
+    const g0 = s.groups.find((g) => g.id === chunkIds[0]);
+    expect(g0?.assignedVehicleKey).toBe('t1:2.1');
+  });
+
+  it('deleting a chunk group prunes the distribution below the 2-chunk minimum', () => {
+    const { survey, chunkIds } = makeDistributedSurvey();
+    useMissionStore.getState().deleteGroup(chunkIds[0]!);
+    const stored = useMissionStore.getState().groups.find((g) => g.id === survey.id);
+    if (stored?.kind !== 'survey') throw new Error();
+    expect(stored.distribution).toBeUndefined();
+  });
+});

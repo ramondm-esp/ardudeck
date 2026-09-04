@@ -86,6 +86,11 @@ export interface SurveyGroup extends BaseGroup {
    * an uninstalled module's data survives.
    */
   generatorResult: unknown;
+  /** While set, generated WPs live in these chunk groups (this group stays
+      empty) and every regeneration re-splits into the same chunks. */
+  distribution?: {
+    chunks: Array<{ groupId: string; vehicleKey: string; label: string; color: string }>;
+  };
 }
 
 export interface ImportedGroup extends BaseGroup {

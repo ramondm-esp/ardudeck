@@ -2664,6 +2664,45 @@ function WaypointListContent({ readOnly = false }: { readOnly?: boolean }) {
                 </Fragment>
               ));
             })}
+            {/* Groups with no waypoints (e.g. a survey emptied by Distribute
+                to fleet) still need a header, or their polygon/config would
+                be unreachable from the list. */}
+            {groups
+              .filter((g) => (itemCountByGroup.get(g.id) ?? 0) === 0)
+              .map((group) => (
+                <GroupHeaderRow
+                  key={group.id}
+                  group={group}
+                  count={0}
+                  readOnly={readOnly}
+                  isSelected={selectedGroupId === group.id}
+                  isEditing={surveyEditingGroupId === group.id}
+                  onVehicleState="none"
+                  onSelect={() => setSelectedGroupId(group.id)}
+                  onToggleCollapse={() => toggleGroupCollapsed(group.id)}
+                  onToggleVisible={() => setGroupVisible(group.id, !group.visible)}
+                  connected={connectionState.isConnected}
+                  onRename={(name) => renameGroup(group.id, name)}
+                  onSetColor={(color) => setGroupColor(group.id, color)}
+                  onDelete={() => deleteGroup(group.id)}
+                  distanceUnit={distanceUnit}
+                  onRegenerate={
+                    isSurveyGroup(group) ? () => regenerateSurveyGroup(group.id) : undefined
+                  }
+                  onEdit={
+                    isSurveyGroup(group)
+                      ? () => {
+                          const sg = group as SurveyGroup;
+                          surveyLoadFromGroup({
+                            id: sg.id,
+                            polygon: sg.polygon,
+                            config: sg.config,
+                          });
+                        }
+                      : undefined
+                  }
+                />
+              ))}
           </div>
         )}
       </div>

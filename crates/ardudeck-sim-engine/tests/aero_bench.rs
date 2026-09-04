@@ -67,9 +67,33 @@ struct Run {
 /// panel and boundary-layer polar, which is the expensive part by orders of
 /// magnitude; doing it per run made the rig take longer than launching the game,
 /// which would have defeated the point of having it.
+/// Launch speed for an article, along its nose.
+///
+/// A PLATE is dropped from rest, because that is what happens to a plate. An
+/// AIRCRAFT is launched at flying speed, because that is what happens to an
+/// aircraft, and dropping one from rest measures it diving to recover rather
+/// than gliding: the glider read 4.4:1 released from rest against 14.5:1 in a
+/// glide, and neither number is wrong, they are answers to different questions.
+fn launch_speed(af: &ardudeck_sim_engine::airframe::Airframe) -> f64 {
+    // What tells them apart is a VERTICAL SURFACE. An aircraft has a fin or a
+    // keel because it needs to hold a heading; a plate has neither. Wing loading
+    // does not work: a paper dart carries 1.9 newtons per square metre, less
+    // than the foam sheet, and got dropped from rest along with it.
+    let has_fin = af
+        .surfaces
+        .iter()
+        .any(|s| s.normal.y.abs() > 0.7);
+    if !has_fin {
+        return 0.0;
+    }
+    // Roughly 1.3 times the speed that supports the weight at CL 1.
+    1.3 * (2.0 * af.wing_loading().max(1.0) / 1.225).sqrt()
+}
+
 fn fly(af: &ardudeck_sim_engine::airframe::Airframe, seed: u32, secs: f64) -> Run {
     let af = af.clone();
     let mass = af.mass;
+    let launch_u = launch_speed(&af);
     let chord = af.surfaces.first().map(|s| s.chord).unwrap_or(0.2);
     // Total lifting area, since the whole airframe makes the force being
     // normalised, not just the reference wing.
@@ -86,7 +110,13 @@ fn fly(af: &ardudeck_sim_engine::airframe::Airframe, seed: u32, secs: f64) -> Ru
     }));
     v.set_seed(seed);
     let alt0 = 800.0;
-    v.set_state(VehicleState { position: Vec3::new(0.0, 0.0, -alt0), ..initial_state() });
+    let u = launch_u;
+    v.set_state(VehicleState {
+        position: Vec3::new(0.0, 0.0, -alt0),
+        velocity: Vec3::new(u * 0.05f64.cos(), 0.0, u * 0.05f64.sin()),
+        attitude: ardudeck_sim_engine::math::Quat::from_euler(0.0, -0.05, 0.0),
+        ..initial_state()
+    });
 
     let weight = mass * G;
     let area = area_ref.max(1e-4);

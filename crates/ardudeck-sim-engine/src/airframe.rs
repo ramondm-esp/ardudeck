@@ -39,8 +39,22 @@ pub struct AirframeSpec {
     pub name: String,
     /// All-up mass (kg).
     pub mass: f64,
-    /// Roll, pitch, yaw moments of inertia about the CG (kg m^2).
+    /// Roll, pitch, yaw moments of inertia about the CG (kg m^2). Ignored when
+    /// `masses` is given, because then they are computed.
     pub inertia: [f64; 3],
+    /// The MASS BREAKDOWN: what the aircraft is made of and where.
+    ///
+    /// Give this and the centre of gravity, the total mass and the inertia
+    /// tensor are all COMPUTED, and every geometric position in the spec is read
+    /// in a fixed airframe datum instead of relative to a CG nobody knows yet.
+    /// That is the right way round: a partner knows their battery is 400 g and
+    /// sits 120 mm behind the nose; where that puts the CG is a result, and one
+    /// they need the sim to tell them rather than to be asked for.
+    ///
+    /// Leave it out and the older behaviour stands: `mass` and `inertia` are
+    /// used as given and positions are already CG-relative.
+    #[serde(default)]
+    pub masses: Vec<MassItem>,
     /// Named airfoil sections, referenced by wings and rotors.
     #[serde(default)]
     pub airfoils: HashMap<String, SectionSpec>,
@@ -60,6 +74,67 @@ pub struct AirframeSpec {
 
 fn default_voltage() -> f64 {
     22.2
+}
+
+/// One item of mass: where it is and what it weighs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MassItem {
+    pub name: String,
+    /// Position in the AIRFRAME DATUM frame, body FRD (m). The datum is
+    /// wherever the spec's other positions are measured from; only differences
+    /// matter, so the nose or the wing leading edge are both fine.
+    pub position: [f64; 3],
+    pub mass: f64,
+    /// The item's own moments of inertia about its own axes (kg m^2), for
+    /// something big enough that treating it as a point is wrong. Most things
+    /// are points at airframe scale.
+    #[serde(default)]
+    pub inertia: Option<[f64; 3]>,
+}
+
+/// What a mass breakdown works out to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MassProperties {
+    pub mass: f64,
+    /// Centre of gravity in the datum frame.
+    pub cg: Vec3,
+    /// Moments of inertia about the CG, body axes.
+    pub inertia: Vec3,
+}
+
+/// Total mass, centre of gravity, and inertia about it, from the breakdown.
+///
+/// Parallel axis theorem, which is the whole of it: each item contributes its
+/// own inertia plus `m d^2` for its offset from the CG. Reported as the diagonal
+/// because the products of inertia are near zero on anything with a plane of
+/// symmetry, which every airframe here has.
+pub fn mass_properties(items: &[MassItem]) -> Option<MassProperties> {
+    if items.is_empty() {
+        return None;
+    }
+    let mass: f64 = items.iter().map(|i| i.mass).sum();
+    if !(mass > 0.0) {
+        return None;
+    }
+    let mut cg = Vec3::zero();
+    for i in items {
+        cg = cg.add(Vec3::new(i.position[0], i.position[1], i.position[2]).scale(i.mass));
+    }
+    cg = cg.scale(1.0 / mass);
+
+    let mut inertia = Vec3::zero();
+    for i in items {
+        let d = Vec3::new(i.position[0], i.position[1], i.position[2]).sub(cg);
+        inertia = inertia.add(Vec3::new(
+            i.mass * (d.y * d.y + d.z * d.z),
+            i.mass * (d.z * d.z + d.x * d.x),
+            i.mass * (d.x * d.x + d.y * d.y),
+        ));
+        if let Some(own) = i.inertia {
+            inertia = inertia.add(Vec3::new(own[0], own[1], own[2]));
+        }
+    }
+    Some(MassProperties { mass, cg, inertia })
 }
 
 /// A named 2D section. Either parametric, or a measured / panel-code polar.
@@ -358,6 +433,16 @@ pub struct Airframe {
     /// Reference wing area (m^2): the first non-vertical panel in the spec,
     /// both sides. Reporting only, and the denominator of `wing_loading`.
     pub wing_area: f64,
+    /// Centre of gravity in the DATUM frame, if a mass breakdown was given.
+    /// Every position stored on this airframe has already been shifted to be
+    /// relative to it, so this is for reporting: it is what the partner wants to
+    /// read back, and what moves when they move a battery.
+    pub cg: Vec3,
+    /// Mean aerodynamic chord (m), and where its leading edge sits relative to
+    /// the CG. The MAC is the length every longitudinal number is quoted
+    /// against, so without it "the CG is 30 mm forward" means nothing.
+    pub mac: f64,
+    pub mac_le_x: f64,
 }
 
 #[derive(Debug)]
@@ -419,11 +504,23 @@ impl AirframeSpec {
     /// default here is a sim that flies a different aircraft than the customer
     /// described and never says so.
     pub fn build(&self) -> Result<Airframe, BuildError> {
-        if !(self.mass > 0.0) || !self.mass.is_finite() {
-            return Err(BuildError::BadMass(self.mass));
+        // A mass breakdown, if given, OVERRIDES the stated mass and inertia and
+        // fixes the CG. Positions in the spec are then read in the datum frame
+        // and shifted below.
+        let props = mass_properties(&self.masses);
+        let (mass, inertia_v, cg) = match props {
+            Some(p) => (p.mass, p.inertia, p.cg),
+            None => (
+                self.mass,
+                Vec3::new(self.inertia[0], self.inertia[1], self.inertia[2]),
+                Vec3::zero(),
+            ),
+        };
+        if !(mass > 0.0) || !mass.is_finite() {
+            return Err(BuildError::BadMass(mass));
         }
-        if self.inertia.iter().any(|i| !(*i > 0.0) || !i.is_finite()) {
-            return Err(BuildError::BadInertia(self.inertia));
+        if [inertia_v.x, inertia_v.y, inertia_v.z].iter().any(|i| !(*i > 0.0) || !i.is_finite()) {
+            return Err(BuildError::BadInertia([inertia_v.x, inertia_v.y, inertia_v.z]));
         }
         // An UNPOWERED airframe is legitimate and is the most useful thing to
         // validate against: a glider's steady glide ratio is exactly its L/D,
@@ -524,11 +621,43 @@ impl AirframeSpec {
             });
         }
 
+        // Shift everything into the CG frame, which is what the physics works
+        // in. With no breakdown `cg` is zero and this is a no-op, so an older
+        // spec is untouched.
+        if cg.length() > 0.0 {
+            for s in surfaces.iter_mut() {
+                s.position = s.position.sub(cg);
+            }
+            for r in rotors.iter_mut() {
+                r.position = r.position.sub(cg);
+            }
+        }
+
+        // Mean aerodynamic chord of the reference wing, and where its leading
+        // edge lands. Standard tapered-wing result.
+        let (mac, mac_le_x) = self
+            .wings
+            .iter()
+            .find(|w| !w.vertical)
+            .map(|w| {
+                let lam = (w.chord_tip / w.chord_root.max(1e-9)).clamp(0.0, 1.0);
+                let mac = (2.0 / 3.0) * w.chord_root * (1.0 + lam + lam * lam) / (1.0 + lam);
+                let y_mac = (w.semi_span.abs() / 3.0) * (1.0 + 2.0 * lam) / (1.0 + lam);
+                // Quarter chord of the MAC, swept back from the root, then
+                // forward a quarter of the MAC to reach its leading edge.
+                let qc = w.root[0] - y_mac * w.sweep_deg.to_radians().tan() - cg.x;
+                (mac, qc + 0.25 * mac)
+            })
+            .unwrap_or((0.2, 0.0));
+
         let f = &self.fuselage;
         Ok(Airframe {
             name: self.name.clone(),
-            mass: self.mass,
-            inertia: Vec3::new(self.inertia[0], self.inertia[1], self.inertia[2]),
+            mass,
+            inertia: inertia_v,
+            cg,
+            mac,
+            mac_le_x,
             voltage_max: self.voltage_max,
             pwm: self.pwm,
             area_cd: Vec3::new(f.area_cd[0], f.area_cd[1], f.area_cd[2]),
@@ -818,6 +947,63 @@ impl Airframe {
         }
     }
 
+    /// Where the CG sits along the mean aerodynamic chord, as a percentage.
+    ///
+    /// THE number anyone setting up an aircraft asks for. "30% MAC" means
+    /// something to everyone; "the CG is at x = 0.012" means nothing without
+    /// knowing the chord it is measured against.
+    pub fn cg_percent_mac(&self) -> f64 {
+        if self.mac <= 1e-9 {
+            return 0.0;
+        }
+        // The CG is the origin of the stored frame, so its offset from the MAC
+        // leading edge is just `-mac_le_x`, and x runs FORWARD.
+        (self.mac_le_x / self.mac) * 100.0
+    }
+
+    /// Longitudinal stability: `(neutral point x relative to the CG, static
+    /// margin as a fraction of MAC)`.
+    ///
+    /// Computed by asking the aircraft, not stated. Two angles of attack, the
+    /// resulting lift and pitching moment, and `dCm/dCL`; the static margin is
+    /// its negative. Positive means the neutral point is BEHIND the CG and the
+    /// aircraft is stable in pitch. Aeromodellers fly 5 to 15 per cent; below
+    /// zero it diverges.
+    ///
+    /// It falls out of the strip sum, so it responds to everything: moving a
+    /// battery, changing the tail, sweeping the wing. That is the point of
+    /// computing it rather than writing it down.
+    pub fn longitudinal_stability(&self, speed: f64) -> (f64, f64) {
+        let q = 0.5 * 1.225 * speed * speed * self.wing_area.max(1e-6);
+        let sample = |a: f64| -> (f64, f64) {
+            let v = Vec3::new(speed * a.cos(), 0.0, speed * a.sin());
+            let flow = crate::aero::FlowField {
+                velocity_air_bf: v,
+                gyro: Vec3::zero(),
+                air_density: 1.225,
+                induced: &crate::aero::no_induced,
+                induced_per_surface: None,
+            };
+            let controls = vec![0.0; self.channel_limits.len()];
+            let out = crate::aero::surface_forces(&self.surfaces, &self.airfoils, &controls, &flow);
+            // Lift across the flight path, moment about the CG.
+            let (ca, sa) = (a.cos(), a.sin());
+            let lift = -out.force_bf.x * sa + -out.force_bf.z * ca;
+            (lift / q, out.moment_bf.y / (q * self.mac.max(1e-9)))
+        };
+        let (cl1, cm1) = sample(1.0f64.to_radians());
+        let (cl2, cm2) = sample(5.0f64.to_radians());
+        let dcl = cl2 - cl1;
+        if dcl.abs() < 1e-9 {
+            return (0.0, 0.0);
+        }
+        let dcm_dcl = (cm2 - cm1) / dcl;
+        let margin = -dcm_dcl;
+        // The CG is the origin here, and x runs forward, so the neutral point
+        // sits `margin * MAC` behind it.
+        (-margin * self.mac, margin)
+    }
+
     /// Total rotor disc area (m^2).
     pub fn disc_area(&self) -> f64 {
         self.rotors.iter().map(|r| r.disc_area()).sum()
@@ -862,5 +1048,58 @@ impl Airframe {
         let ch = &self.rotor_channels[rotor];
         let u = self.servo_unit(pwm);
         ch.tilt_min + (ch.tilt_max - ch.tilt_min) * u
+    }
+}
+
+#[cfg(test)]
+mod mass_tests {
+    use super::*;
+
+    /// The CG of two equal masses is halfway between them, and the inertia is
+    /// the parallel-axis result. Arithmetic, but it is the arithmetic every
+    /// downstream number rests on.
+    #[test]
+    fn a_mass_breakdown_gives_the_centre_of_gravity_and_inertia() {
+        let items = vec![
+            MassItem { name: "a".into(), position: [1.0, 0.0, 0.0], mass: 2.0, inertia: None },
+            MassItem { name: "b".into(), position: [-1.0, 0.0, 0.0], mass: 2.0, inertia: None },
+        ];
+        let p = mass_properties(&items).unwrap();
+        assert!((p.mass - 4.0).abs() < 1e-12);
+        assert!(p.cg.length() < 1e-12, "cg {:?}", p.cg);
+        // Two 2 kg points a metre either side: 2*1^2 twice about pitch and yaw,
+        // nothing about roll because they sit on that axis.
+        assert!(p.inertia.x.abs() < 1e-12, "roll {}", p.inertia.x);
+        assert!((p.inertia.y - 4.0).abs() < 1e-12, "pitch {}", p.inertia.y);
+        assert!((p.inertia.z - 4.0).abs() < 1e-12, "yaw {}", p.inertia.z);
+    }
+
+    /// Moving a mass moves the CG toward it, proportionally.
+    #[test]
+    fn moving_a_mass_moves_the_centre_of_gravity() {
+        let at = |x: f64| {
+            mass_properties(&[
+                MassItem { name: "body".into(), position: [0.0, 0.0, 0.0], mass: 1.0, inertia: None },
+                MassItem { name: "battery".into(), position: [x, 0.0, 0.0], mass: 1.0, inertia: None },
+            ])
+            .unwrap()
+            .cg
+            .x
+        };
+        assert!((at(0.2) - 0.1).abs() < 1e-12);
+        assert!((at(0.4) - 0.2).abs() < 1e-12);
+        assert!(at(-0.2) < 0.0, "moving it aft must move the CG aft");
+    }
+
+    #[test]
+    fn an_empty_or_massless_breakdown_is_no_breakdown() {
+        assert!(mass_properties(&[]).is_none());
+        assert!(mass_properties(&[MassItem {
+            name: "nothing".into(),
+            position: [0.0; 3],
+            mass: 0.0,
+            inertia: None
+        }])
+        .is_none());
     }
 }

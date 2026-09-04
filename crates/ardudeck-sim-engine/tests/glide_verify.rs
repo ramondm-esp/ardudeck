@@ -500,20 +500,21 @@ fn tumble_stats(json: &str, seed: u32, secs: f64) -> (f64, f64, f64) {
     ((signed / turn.max(1e-9)).abs(), turn / tau, horiz / fell)
 }
 
-/// KNOWN GAP: a very thin section at low Reynolds number reaches a lift
-/// coefficient it should not.
+/// KNOWN GAP, NARROWED: a very thin section still reaches a lift coefficient
+/// higher than it should, though far less so than it did.
 ///
-/// The aspect-ratio 1 sheet wearing a NACA 0004 peaks near |CL| 2.0. A 4%
-/// section at Re 2e5 measures nearer 0.8 and stalls around 8 to 10 degrees:
-/// its sharp nose makes a suction peak the boundary layer cannot survive, which
-/// is the very effect the panel solve shows clearly in the tunnel.
+/// Adding leading-edge stall (Owen and Klanfer's bubble-burst criterion,
+/// blended rather than switched) brought the peak from 2.41 down to 1.71, and
+/// the thicker sections into range: NACA 0012 peaks at 1.36 near 12 degrees
+/// against a measured 1.0 near 13, and the 0018 at 1.41 near 12.5 against 1.2
+/// near 15. Those are usable.
 ///
-/// The inviscid solve is right and the suction peak is there. What is too
-/// generous is the STALL CRITERION on top of it: separation is only counted
-/// once it has run to 80% of the chord, which a leading-edge stall never does
-/// gradually. Head's entrainment method under-predicts separation growth in
-/// exactly this regime, and replacing it with a lagged-dissipation closure is
-/// the same fix already noted in `bl.rs`.
+/// The 4% section is not: 1.08 at 16.5 degrees where it should be near 0.7 at
+/// 7, and it now out-lifts the 8% section, which is the wrong way round. The
+/// burst criterion needs the bubble resolved over its own LENGTH near the nose,
+/// and Thwaites plus Michel plus Head does not resolve it finely enough there.
+/// The remaining fix is the one already noted in `bl.rs`: XFOIL's
+/// lagged-dissipation closure with e^N transition.
 #[test]
 #[ignore = "records a known gap: thin sections stall too late at low Reynolds number"]
 fn thin_sections_should_not_reach_a_lift_coefficient_of_two() {
@@ -595,6 +596,63 @@ fn the_glider_still_glides_rather_than_tumbling() {
         // matters here is that it GLIDES rather than tumbling.
         assert!(glide > 1.5, "glided only {glide:.2}:1 (seed {seed})");
     }
+}
+
+/// Mass properties are COMPUTED from the breakdown, and everything
+/// longitudinal follows: move the battery and the centre of gravity, the pitch
+/// inertia and the static margin all move with it.
+///
+/// This is what a partner setting up an airframe actually needs. They know
+/// their battery weighs 200 g and where it sits; where that puts the CG, and
+/// whether the aircraft is then flyable, is the answer they want back.
+#[test]
+fn moving_the_battery_moves_the_cg_and_the_static_margin() {
+    let at = |x: f64| {
+        let j = GLIDER.replace(
+            r#""position": [ 0.24,  0.00,  0.00], "mass": 0.200"#,
+            &format!(r#""position": [{x:5.2},  0.00,  0.00], "mass": 0.200"#),
+        );
+        let af = AirframeSpec::from_json(&j).unwrap().build().unwrap();
+        let (_, sm) = af.longitudinal_stability(12.0);
+        (af.mass, af.cg_percent_mac(), af.inertia.y, sm)
+    };
+
+    let fwd = at(0.40);
+    let mid = at(0.24);
+    let aft = at(-0.10);
+
+    // Total mass never changes: the battery only moved.
+    for m in [fwd.0, mid.0, aft.0] {
+        assert!((m - 0.8).abs() < 1e-9, "mass changed: {m}");
+    }
+    // The CG follows the battery, monotonically.
+    assert!(fwd.1 < mid.1 && mid.1 < aft.1, "CG did not track the battery: {:.1} {:.1} {:.1}", fwd.1, mid.1, aft.1);
+    // And the static margin falls as it goes aft, through neutral into
+    // divergence. An aircraft with its CG behind the neutral point cannot be
+    // flown, and this is the number that says so.
+    assert!(fwd.3 > mid.3 && mid.3 > aft.3, "margin did not fall: {:+.3} {:+.3} {:+.3}", fwd.3, mid.3, aft.3);
+    assert!(fwd.3 > 0.0, "nose-heavy should be stable: {:+.3}", fwd.3);
+    assert!(aft.3 < 0.0, "tail-heavy should be unstable: {:+.3}", aft.3);
+    // Pitch inertia is LEAST with the mass near the CG, which is the parallel
+    // axis theorem showing up in something a person can act on.
+    assert!(at(0.10).2 < fwd.2, "moving mass toward the CG must lower Iyy");
+}
+
+/// A uniform plate is unstable in pitch and an aircraft is not, and both fall
+/// out of the same computation.
+#[test]
+fn the_articles_have_the_stability_their_shapes_imply() {
+    let margin = |json: &str| {
+        AirframeSpec::from_json(json).unwrap().build().unwrap().longitudinal_stability(12.0).1
+    };
+    // A uniform sheet carries its mass at mid-chord and its lift at the quarter
+    // chord, so it cannot be stable. That is why it tumbles.
+    assert!(margin(FOAM_SHEET) < 0.0, "the sheet should be unstable: {:+.3}", margin(FOAM_SHEET));
+    // A dart and a glider are aircraft.
+    let dart = margin(PAPER_PLANE);
+    let glider = margin(GLIDER);
+    assert!(dart > 0.0 && dart < 0.5, "dart margin {:+.3}", dart);
+    assert!(glider > 0.0 && glider < 0.5, "glider margin {:+.3}", glider);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -991,6 +1049,14 @@ fn the_glider_phugoids_as_an_energy_exchange() {
 fn the_phugoid_period_grows_with_trim_speed() {
     let period_at = |mass: f64| -> (f64, f64) {
         let mut spec = AirframeSpec::from_json(GLIDER).unwrap();
+        // LOADED, not relabelled. `spec.mass` is ignored once a breakdown is
+        // given, which is the point of having one: the mass is what the parts
+        // weigh. Scaling every item keeps the centre of gravity where it was and
+        // changes only the weight, which is what this test wants.
+        let k = mass / spec.masses.iter().map(|m| m.mass).sum::<f64>();
+        for m in spec.masses.iter_mut() {
+            m.mass *= k;
+        }
         spec.mass = mass;
         let af = spec.build().unwrap();
         let mut v =
@@ -1215,3 +1281,5 @@ fn probe_spin_rate2() {
             (signed/turn.max(1e-9)).abs(), turn/(2.0*std::f64::consts::PI), horiz/(-s.position.z-400.0).abs().max(1e-9));
     }
 }
+
+

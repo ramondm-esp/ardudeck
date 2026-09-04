@@ -80,6 +80,14 @@ pub const PAPER_PLANE: &str = r#"{
 /// A 2 m model glider, about 14:1.
 pub const GLIDER: &str = r#"{
   "name": "glider-2m", "mass": 0.80, "inertia": [0.045, 0.030, 0.070],
+  "masses": [
+    { "name": "wing left",  "position": [ 0.00, -0.45, -0.04], "mass": 0.150 },
+    { "name": "wing right", "position": [ 0.00,  0.45, -0.04], "mass": 0.150 },
+    { "name": "boom",       "position": [-0.31,  0.00,  0.00], "mass": 0.100 },
+    { "name": "tail",       "position": [-0.62,  0.00, -0.02], "mass": 0.050 },
+    { "name": "battery",    "position": [ 0.24,  0.00,  0.00], "mass": 0.200 },
+    { "name": "nose, rx",   "position": [ 0.10,  0.00,  0.00], "mass": 0.150 }
+  ],
   "airfoils": {
     "wing": { "cl_alpha": 6.10, "alpha_0_deg": -2.0, "alpha_stall_deg": 12.0,
               "alpha_stall_neg_deg": -10.0, "cd_min": 0.011, "cd_k": 0.006, "cm_0": -0.05 },
