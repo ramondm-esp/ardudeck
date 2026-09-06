@@ -329,6 +329,8 @@ interface MissionStore {
   /** Assign (or clear with null) the fleet vehicle this group uploads to / is coloured by. */
   setGroupVehicle: (groupId: string, vehicleKey: string | null) => void;
   deleteGroup: (groupId: string) => void;
+  /** Delete several groups in one edit (single renumber, single undo step). */
+  deleteGroups: (groupIds: string[]) => void;
   toggleGroupCollapsed: (groupId: string) => void;
   /** Toggle whether a group is shown on the map. */
   setGroupVisible: (groupId: string, visible: boolean) => void;
@@ -816,6 +818,9 @@ export const useMissionStore = create<MissionStore>((set, get) => ({
             progress: null,
             error: null,
             lastSuccessMessage: 'Mission cleared from FC',
+            lastUploadedAt: null,
+            lastUploadedGroupIds: [],
+            lastUploadedItemCount: 0,
           });
           return true;
         } else {
@@ -1124,28 +1129,39 @@ export const useMissionStore = create<MissionStore>((set, get) => ({
    * for users who want to keep the WPs but lose the group structure.
    */
   deleteGroup: (groupId) => {
+    get().deleteGroups([groupId]);
+  },
+
+  /**
+   * Delete several groups as ONE edit. Looping deleteGroup would renumber the
+   * whole mission once per group and leave a separate undo step for each.
+   */
+  deleteGroups: (groupIds) => {
+    const doomed = new Set(groupIds);
+    if (doomed.size === 0) return;
     set((s) => {
-      const remainingItems = s.missionItems.filter((it) => it.groupId !== groupId);
+      const remainingItems = s.missionItems.filter((it) => !doomed.has(it.groupId ?? ''));
       const renumbered = remainingItems.map((it, idx) => ({ ...it, seq: idx }));
       // Below 2 chunks a distribution is meaningless and clears entirely.
       const remainingGroups = s.groups
-        .filter((g) => g.id !== groupId)
+        .filter((g) => !doomed.has(g.id))
         .map((g) => {
           if (g.kind !== 'survey') return g;
           const sg = g as SurveyGroup;
-          if (!sg.distribution?.chunks.some((c) => c.groupId === groupId)) return g;
-          const chunks = sg.distribution.chunks.filter((c) => c.groupId !== groupId);
+          if (!sg.distribution?.chunks.some((c) => doomed.has(c.groupId))) return g;
+          const chunks = sg.distribution.chunks.filter((c) => !doomed.has(c.groupId));
           return {
             ...sg,
             distribution: chunks.length >= 2 ? { chunks } : undefined,
             updatedAt: Date.now(),
           } as Group;
         });
-      // Selection cleanup: if the selected WP was in the deleted group,
-      // clear it. Otherwise re-resolve its seq after renumbering.
+      // Selection cleanup: if the selected WP was in a deleted group, clear it.
       let nextSelected: number | null = s.selectedSeq;
       if (s.selectedSeq !== null) {
-        const wasInGroup = s.missionItems.find((it) => it.seq === s.selectedSeq)?.groupId === groupId;
+        const wasInGroup = doomed.has(
+          s.missionItems.find((it) => it.seq === s.selectedSeq)?.groupId ?? '',
+        );
         nextSelected = wasInGroup ? null : nextSelected;
       }
       return {
@@ -1532,6 +1548,11 @@ export const useMissionStore = create<MissionStore>((set, get) => ({
       progress: null,
       error: null,
       lastSuccessMessage: 'Mission cleared from flight controller',
+      // The plan stays in the planner; only the vehicle was cleared. Drop the
+      // upload record so the UI stops claiming the vehicle holds this mission.
+      lastUploadedAt: null,
+      lastUploadedGroupIds: [],
+      lastUploadedItemCount: 0,
     });
   },
 

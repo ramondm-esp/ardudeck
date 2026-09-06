@@ -507,7 +507,7 @@ const ParameterTable: React.FC = () => {
   const handleApplySelectedParams = useCallback(async () => {
     const result = await applySelectedFileParams();
     if (result.applied > 0) {
-      showToast(`Applied ${result.applied} parameter${result.applied !== 1 ? 's' : ''} to vehicle${result.failed > 0 ? ` (${result.failed} failed)` : ''}`, result.failed > 0 ? 'info' : 'success');
+      showToast(`Applied ${result.applied} parameter${result.applied !== 1 ? 's' : ''} to vehicle${result.failed > 0 ? ` (${result.failed} failed)` : ''}${result.applied > 0 ? ' — Save All Changes to keep them after a reboot' : ''}`, result.failed > 0 ? 'info' : 'success');
     } else if (result.failed > 0) {
       showToast(`Failed to apply ${result.failed} parameter${result.failed !== 1 ? 's' : ''}`, 'error');
     }

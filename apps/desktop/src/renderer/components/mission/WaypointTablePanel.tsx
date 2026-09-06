@@ -1393,6 +1393,8 @@ function GroupHeaderRow({
   assignedVehicleKey,
   onAssignVehicle,
   onDistribute,
+  bulkSelected,
+  onToggleBulkSelected,
 }: {
   group: Group;
   count: number;
@@ -1439,6 +1441,9 @@ function GroupHeaderRow({
   onAssignVehicle?: (vehicleKey: string | null) => void;
   /** Split this group into one mission per fleet vehicle (swarm survey). */
   onDistribute?: () => void;
+  /** Ticked for bulk actions. Undefined hides the checkbox entirely. */
+  bulkSelected?: boolean;
+  onToggleBulkSelected?: (additive: boolean) => void;
 }) {
   const isStaleSurvey = isSurveyGroup(group) && isSurveyGroupStale(group);
   const [editing, setEditing] = useState(false);
@@ -1486,6 +1491,24 @@ function GroupHeaderRow({
       onClick={onSelect}
     >
       <div className="flex items-center gap-2 px-2 pt-1.5 pb-0.5">
+      {!readOnly && onToggleBulkSelected && (
+        <div
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggleBulkSelected(e.shiftKey);
+          }}
+          onMouseDown={(e) => e.stopPropagation()}
+          className="shrink-0 flex items-center justify-center w-5 h-5"
+          data-tip="Select this group for bulk actions"
+        >
+          <input
+            type="checkbox"
+            checked={!!bulkSelected}
+            onChange={() => { /* handled by wrapper onClick */ }}
+            className="w-3.5 h-3.5 rounded border-subtle bg-surface-raised text-blue-500 focus:ring-1 focus:ring-blue-500 cursor-pointer"
+          />
+        </div>
+      )}
       {!readOnly && (
         <div
           onClick={(e) => {
@@ -1824,7 +1847,9 @@ function WaypointListContent({ readOnly = false }: { readOnly?: boolean }) {
     renameGroup,
     setGroupColor,
     setGroupVehicle,
+    clearMission,
     deleteGroup,
+    deleteGroups,
     toggleGroupCollapsed,
     setGroupVisible,
     focusWaypoint,
@@ -1942,6 +1967,10 @@ function WaypointListContent({ readOnly = false }: { readOnly?: boolean }) {
   const [dropTargetSeq, setDropTargetSeq] = useState<number | null>(null);
   const [collapsedGroups, setCollapsedGroups] = useState<Set<number>>(new Set());
   const [multiSelected, setMultiSelected] = useState<Set<number>>(new Set());
+  // Group-level selection, independent of the per-waypoint one: deleting three
+  // survey groups meant opening three overflow menus.
+  const [bulkGroups, setBulkGroups] = useState<Set<string>>(new Set());
+  const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
   const [lastCheckedSeq, setLastCheckedSeq] = useState<number | null>(null);
   const tableRef = useRef<HTMLDivElement>(null);
 
@@ -2100,6 +2129,21 @@ function WaypointListContent({ readOnly = false }: { readOnly?: boolean }) {
 
   const [coordsCopied, setCoordsCopied] = useState(false);
   const [wpCoordCopied, setWpCoordCopied] = useState(false);
+  const toggleBulkGroup = useCallback((groupId: string) => {
+    setBulkGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(groupId)) next.delete(groupId);
+      else next.add(groupId);
+      return next;
+    });
+  }, []);
+
+  const handleDeleteBulkGroups = useCallback(() => {
+    if (bulkGroups.size === 0) return;
+    deleteGroups([...bulkGroups]);
+    setBulkGroups(new Set());
+  }, [bulkGroups, deleteGroups]);
+
   const handleCopyCoords = () => {
     const source = multiSelected.size > 0
       ? missionItems.filter(w => multiSelected.has(w.seq))
@@ -2233,7 +2277,38 @@ function WaypointListContent({ readOnly = false }: { readOnly?: boolean }) {
       {/* Header: collapse/expand or, when multi-selected, bulk actions */}
       {missionItems.length > 0 && (
         <div className="shrink-0 px-3 py-1.5 border-b border-subtle flex items-center justify-between">
-          {!readOnly && multiSelected.size > 0 ? (
+          {!readOnly && bulkGroups.size > 0 ? (
+            <>
+              <span className="text-[10px] text-content-secondary">
+                {bulkGroups.size} group{bulkGroups.size === 1 ? '' : 's'} selected
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setBulkGroups(new Set(groups.map((g) => g.id)))}
+                  className="text-[10px] text-content-secondary hover:text-content transition-colors"
+                  title="Select every group"
+                >
+                  Select all
+                </button>
+                <span className="text-content-tertiary text-[10px]">|</span>
+                <button
+                  onClick={() => setBulkGroups(new Set())}
+                  className="text-[10px] text-content-secondary hover:text-content transition-colors"
+                  title="Clear group selection"
+                >
+                  Clear
+                </button>
+                <span className="text-content-tertiary text-[10px]">|</span>
+                <button
+                  onClick={handleDeleteBulkGroups}
+                  className="text-[10px] text-red-400 hover:text-red-300 transition-colors font-medium"
+                  title={`Delete ${bulkGroups.size} group${bulkGroups.size === 1 ? '' : 's'} and their waypoints`}
+                >
+                  Delete groups
+                </button>
+              </div>
+            </>
+          ) : !readOnly && multiSelected.size > 0 ? (
             <>
               <span className="text-[10px] text-content-secondary">
                 {multiSelected.size} of {missionItems.length} selected
@@ -2299,6 +2374,30 @@ function WaypointListContent({ readOnly = false }: { readOnly?: boolean }) {
                 >
                   Expand all
                 </button>
+                {!readOnly && missionItems.length > 0 && (
+                  <>
+                    <span className="text-content-tertiary text-[10px]">|</span>
+                    {/* Two-step rather than a modal: destructive, but this bar is
+                        transient and a dialog here would be heavier than the action. */}
+                    <button
+                      onClick={() => {
+                        if (confirmDeleteAll) {
+                          clearMission();
+                          setConfirmDeleteAll(false);
+                        } else {
+                          setConfirmDeleteAll(true);
+                        }
+                      }}
+                      onBlur={() => setConfirmDeleteAll(false)}
+                      className="text-[10px] text-red-400 hover:text-red-300 transition-colors font-medium"
+                      data-tip="Remove every waypoint from the planner. Does not touch the vehicle."
+                    >
+                      {confirmDeleteAll
+                        ? `Delete all ${missionItems.length}?`
+                        : 'Delete all'}
+                    </button>
+                  </>
+                )}
               </div>
             </>
           )}
@@ -2431,6 +2530,8 @@ function WaypointListContent({ readOnly = false }: { readOnly?: boolean }) {
                     onRename={(name) => renameGroup(group.id, name)}
                     onSetColor={(color) => setGroupColor(group.id, color)}
                     onDelete={() => deleteGroup(group.id)}
+                    bulkSelected={bulkGroups.has(group.id)}
+                    onToggleBulkSelected={() => toggleBulkGroup(group.id)}
                     distanceUnit={distanceUnit}
                     onRegenerate={
                       isSurveyGroup(group)
@@ -2685,6 +2786,8 @@ function WaypointListContent({ readOnly = false }: { readOnly?: boolean }) {
                   onRename={(name) => renameGroup(group.id, name)}
                   onSetColor={(color) => setGroupColor(group.id, color)}
                   onDelete={() => deleteGroup(group.id)}
+                  bulkSelected={bulkGroups.has(group.id)}
+                  onToggleBulkSelected={() => toggleBulkGroup(group.id)}
                   distanceUnit={distanceUnit}
                   onRegenerate={
                     isSurveyGroup(group) ? () => regenerateSurveyGroup(group.id) : undefined

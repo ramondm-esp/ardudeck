@@ -321,6 +321,31 @@ function SummaryView({ result, onClose, onGoToParameters }: SummaryViewProps) {
             </span>
           </div>
         )}
+        {/* Applied means sent and acknowledged, not yet committed to the FC's
+            permanent storage. Without saying so the values look final here and
+            then quietly revert on the next power cycle. */}
+        {result.applied > 0 && (
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+            <div>
+              <span className="text-sm text-amber-300">
+                Not saved permanently yet
+              </span>
+              <p className="text-xs text-content-secondary mt-1">
+                The vehicle is using {result.applied === 1 ? 'this value' : 'these values'} now, but
+                {' '}{result.applied === 1 ? 'it' : 'they'} will revert on the next reboot until you
+                press <span className="text-content font-medium">Save All Changes</span> on the
+                Parameters screen.
+              </p>
+              <button
+                onClick={onGoToParameters}
+                className="mt-2 text-xs text-amber-300 underline hover:text-amber-200"
+              >
+                Go to Parameters to save
+              </button>
+            </div>
+          </div>
+        )}
         {result.rebootRequired.length > 0 && (
           <div className="flex items-start gap-3">
             <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />

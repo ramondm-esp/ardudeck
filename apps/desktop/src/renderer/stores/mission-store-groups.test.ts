@@ -268,3 +268,67 @@ describe('distributed survey reacts to regeneration', () => {
     expect(stored.distribution).toBeUndefined();
   });
 });
+
+describe('deleteGroups (bulk)', () => {
+  const poly = [
+    { lat: 0, lng: 0 },
+    { lat: 1, lng: 0 },
+    { lat: 1, lng: 1 },
+  ];
+  const mk = (name: string) =>
+    createSurveyGroup({
+      name,
+      generatorId: 'builtin.grid',
+      generatorVersion: '1.0.0',
+      polygon: poly,
+      config: { altitude: 50 },
+    });
+
+  beforeEach(() => {
+    useMissionStore.getState().reset();
+  });
+
+  it('removes several groups and their waypoints in one edit', () => {
+    const a = mk('a');
+    const b = mk('b');
+    const c = mk('c');
+    useMissionStore.getState().addSurveyGroup(a, [wp(0), wp(1)]);
+    useMissionStore.getState().addSurveyGroup(b, [wp(0)]);
+    useMissionStore.getState().addSurveyGroup(c, [wp(0), wp(1)]);
+
+    useMissionStore.getState().deleteGroups([a.id, c.id]);
+
+    const st = useMissionStore.getState();
+    expect(st.groups.map((g) => g.id)).toEqual([b.id]);
+    expect(st.missionItems).toHaveLength(1);
+    expect(st.missionItems.every((it) => it.groupId === b.id)).toBe(true);
+  });
+
+  it('renumbers the survivors once, leaving a contiguous sequence', () => {
+    const a = mk('a');
+    const b = mk('b');
+    useMissionStore.getState().addSurveyGroup(a, [wp(0), wp(1), wp(2)]);
+    useMissionStore.getState().addSurveyGroup(b, [wp(0), wp(1)]);
+
+    useMissionStore.getState().deleteGroups([a.id]);
+
+    const seqs = useMissionStore.getState().missionItems.map((it) => it.seq);
+    expect(seqs).toEqual([0, 1]);
+  });
+
+  it('is a no-op for an empty list', () => {
+    const a = mk('a');
+    useMissionStore.getState().addSurveyGroup(a, [wp(0)]);
+    useMissionStore.getState().deleteGroups([]);
+    expect(useMissionStore.getState().groups.map((g) => g.id)).toEqual([a.id]);
+  });
+
+  it('deleteGroup still works, going through the same path', () => {
+    const a = mk('a');
+    const b = mk('b');
+    useMissionStore.getState().addSurveyGroup(a, [wp(0)]);
+    useMissionStore.getState().addSurveyGroup(b, [wp(0)]);
+    useMissionStore.getState().deleteGroup(a.id);
+    expect(useMissionStore.getState().groups.map((g) => g.id)).toEqual([b.id]);
+  });
+});

@@ -454,8 +454,10 @@ export function MissionToolbar({ onResetLayout, showToast }: MissionToolbarProps
     if (!isConnected) return;
 
     if (activeMode === 'mission') {
+      // Clears the vehicle ONLY. The planner keeps its waypoints: wiping hours
+      // of planning as a side effect of clearing the FC is not something the
+      // button says it does, and there is no undo across an upload boundary.
       await missionStore.clearMissionFromFC();
-      missionStore.clearMission();
     } else if (activeMode === 'geofence') {
       await fenceStore.clearFenceFromFC();
     } else {
