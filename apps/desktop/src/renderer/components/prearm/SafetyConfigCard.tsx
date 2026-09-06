@@ -110,6 +110,9 @@ function FindingRow({ finding }: { finding: SafetyFinding }) {
 
 export function SafetyConfigCard() {
   const parameters = useParameterStore((s) => s.parameters);
+  // Safety findings computed from a partial set would read as "no issues"
+  // simply because the parameters they check had not arrived.
+  const paramsLoaded = useParameterStore((s) => s.downloadState === 'complete');
   const boardUid = useConnectionStore((s) => s.connectionState.boardUid);
   const isConnected = useConnectionStore((s) => s.connectionState.isConnected);
   const [records, setRecords] = useState<CalibrationRecordIpc[]>([]);
@@ -127,7 +130,7 @@ export function SafetyConfigCard() {
   }, [boardUid, isConnected]);
 
   const findings = useMemo(() => {
-    if (!isConnected || parameters.size === 0) return [];
+    if (!isConnected || !paramsLoaded || parameters.size === 0) return [];
 
     const values = new Map<string, number>();
     for (const [id, param] of parameters) values.set(id, param.value);
@@ -141,7 +144,7 @@ export function SafetyConfigCard() {
       calibrationLost: Boolean(lost),
       calibrationLostType: lost?.type,
     });
-  }, [parameters, records, isConnected]);
+  }, [parameters, paramsLoaded, records, isConnected]);
 
   // Nothing to say: show nothing at all.
   if (findings.length === 0) return null;

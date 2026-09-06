@@ -26,6 +26,7 @@ import { LogsView } from './components/logs/LogsView';
 import { MavlinkInspectorView } from './components/inspector/MavlinkInspectorView';
 import { VaultView } from './components/vault/VaultView';
 import { WeatherBriefingView } from './components/weather/WeatherBriefingView';
+import { TrainerView } from './components/trainer/TrainerView';
 import { setupWorkspaceSync } from './stores/workspace-store';
 import { startInspector } from './stores/inspector-store';
 import { startCompassCoverageListener } from './stores/compass-coverage-store';
@@ -1055,6 +1056,9 @@ function App() {
         // Briefing works offline: falls back to home / map center when no vehicle.
         return <WeatherBriefingView />;
       }
+      if (currentView === 'trainer') {
+        return <TrainerView />;
+      }
       if (currentView === 'settings') {
         return <SettingsView />;
       }
@@ -1151,6 +1155,8 @@ function App() {
         return <MavlinkInspectorView />;
       case 'weather':
         return <WeatherBriefingView />;
+      case 'trainer':
+        return <TrainerView />;
       case 'vault':
         return <VaultView />;
       case 'telemetry':

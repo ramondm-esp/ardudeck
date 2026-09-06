@@ -23,7 +23,9 @@ interface ApplyProfileButtonProps {
 export function ApplyProfileButton({ profile, onBeforeStart, size = 'compact' }: ApplyProfileButtonProps) {
   const isConnected = useConnectionStore(s => s.connectionState.isConnected);
   const isSitl = useConnectionStore(s => s.connectionState.isSitl ?? false);
-  const paramCount = useParameterStore(s => s.parameters.size);
+  // Zero unless a full download landed: applying a profile diffed against a
+  // few connect-time reads would write the wrong deltas.
+  const paramCount = useParameterStore(s => (s.downloadState === 'complete' ? s.parameters.size : 0));
   const armed = useTelemetryStore(s => s.flight.armed);
   const hasFleetVehicles = useActiveVehicleStore(s => Object.keys(s.knownVehicles).length > 0);
   // A fleet is live but there's no primary single connection. Profiles are a bulk

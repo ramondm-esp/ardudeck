@@ -200,15 +200,22 @@ async function init(): Promise<void> {
     const mod = await import('../stores/parameter-store');
     const store = mod.useParameterStore;
     const snap = () => {
-      const s = store.getState();
+      const s = store.getState() as any;
       return {
-        size: (s as any).parameters?.size ?? 0,
-        isLoading: !!(s as any).isLoading,
+        size: s.parameters?.size ?? 0,
+        isLoading: !!s.isLoading,
+        // A full download landed, as opposed to a few parameters that happen to
+        // be sitting in the store. Connect-time batch reads (safety monitor,
+        // Q_ENABLE, calibration) put a handful there before anything is
+        // downloaded, so `size > 0` reported "already loaded" with six
+        // unrelated entries and every lookup came back empty until the user
+        // opened the Parameters screen and triggered a real fetch.
+        complete: typeof s.hasFullParameterSet === 'function' ? s.hasFullParameterSet() : s.size > 0,
       };
     };
 
     const initial = snap();
-    if (initial.size > 0) {
+    if (initial.complete && initial.size > 0) {
       return { ok: true, count: initial.size, alreadyLoaded: true };
     }
 
@@ -223,14 +230,14 @@ async function init(): Promise<void> {
       void fetchParameters();
     }
 
-    // Wait until size > 0 AND isLoading=false, or timeout.
+    // Wait for a COMPLETED download, not merely for loading to stop.
     return new Promise<{ ok: true; count: number; alreadyLoaded: false }>((resolve, reject) => {
       const start = Date.now();
       let stableStart: number | null = null;
       const unsub = store.subscribe(() => {});
       const tick = () => {
         const s = snap();
-        if (s.size > 0 && !s.isLoading) {
+        if (s.complete && s.size > 0 && !s.isLoading) {
           // Settle for 250ms to avoid returning mid-download when batches arrive.
           if (stableStart === null) stableStart = Date.now();
           if (Date.now() - stableStart >= 250) {
@@ -270,7 +277,6 @@ async function init(): Promise<void> {
     }
 
     const telemetryMod = await import('../stores/telemetry-store');
-    const navMod = await import('../stores/navigation-store');
     const paramMod = await import('../stores/parameter-store');
 
     const tState = telemetryMod.useTelemetryStore.getState() as any;
@@ -281,9 +287,17 @@ async function init(): Promise<void> {
       };
     }
 
-    // Ensure params are loaded so we can look up types / current values.
+    // A full set has to be present before diffing, not merely some parameters:
+    // connect-time batch reads leave a handful in the store, and against those
+    // every proposal is rejected as "unknown parameter".
     const pStore = paramMod.useParameterStore;
-    if (((pStore.getState() as any).parameters?.size ?? 0) === 0) {
+    const hasAll = () => {
+      const st = pStore.getState() as any;
+      return typeof st.hasFullParameterSet === 'function'
+        ? st.hasFullParameterSet()
+        : (st.parameters?.size ?? 0) > 0;
+    };
+    if (!hasAll()) {
       const fetchParameters = (pStore.getState() as any).fetchParameters as
         | (() => Promise<void>)
         | undefined;
@@ -291,12 +305,13 @@ async function init(): Promise<void> {
         await fetchParameters();
         const deadline = Date.now() + 45_000;
         while (Date.now() < deadline) {
-          const sz = (pStore.getState() as any).parameters?.size ?? 0;
-          const loading = !!(pStore.getState() as any).isLoading;
-          if (sz > 0 && !loading) break;
+          if (hasAll()) break;
           await new Promise((r) => setTimeout(r, 100));
         }
       }
+    }
+    if (!hasAll()) {
+      return { ok: false, reason: 'parameters are not loaded; could not verify the proposals' };
     }
 
     const paramMap: Map<string, any> = (pStore.getState() as any).parameters;
@@ -347,13 +362,10 @@ async function init(): Promise<void> {
       fileApplyResult: null,
     } as any);
 
-    // Surface the review to the user: switch to Parameters view.
-    try {
-      const navSet = (navMod.useNavigationStore.getState() as any).setView;
-      if (typeof navSet === 'function') navSet('parameters');
-    } catch {
-      // ignore; staying on current view still works
-    }
+    // No navigation: ParameterCompareModalRoot is mounted at App root exactly so
+    // this dialog appears over whatever view the user is on. Yanking them to the
+    // Parameters screen to approve a change moves them away from what they were
+    // doing, mid-flight included.
 
     // Wait for the modal to close (apply or cancel). Resolve with outcome.
     return new Promise<any>((resolve, reject) => {

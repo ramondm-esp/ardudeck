@@ -29,6 +29,7 @@ import {
   X,
 } from 'lucide-react';
 import { useConnectionStore } from '../../stores/connection-store';
+import { scanCardUsage, type CardUsage } from './card-usage';
 
 interface DirEntry {
   kind: 'dir' | 'file';
@@ -60,6 +61,8 @@ export const FilesTab: React.FC = () => {
   const [renameTarget, setRenameTarget] = useState<DirEntry | null>(null);
   const [storageInfo, setStorageInfo] =
     useState<{ totalBytes: number; usedBytes: number; availableBytes: number } | null>(null);
+  const [cardUsage, setCardUsage] = useState<CardUsage | null>(null);
+  const [scanning, setScanning] = useState(false);
   const [eraseLogsOpen, setEraseLogsOpen] = useState(false);
   const [erasingLogs, setErasingLogs] = useState(false);
   const [eraseLogsDone, setEraseLogsDone] = useState(false);
@@ -91,9 +94,27 @@ export const FilesTab: React.FC = () => {
     window.electronAPI.logStorageInfo().then(setStorageInfo).catch(() => setStorageInfo(null));
   }, []);
 
+  // ArduPilot never answers STORAGE_INFORMATION for its own SD card, so walk
+  // the filesystem instead. This is the figure that explains a card which
+  // "is not full" yet silently stops logging.
+  const scanCard = useCallback(async () => {
+    setScanning(true);
+    try {
+      const usage = await scanCardUsage(async (p) => {
+        const r = await window.electronAPI.mavlinkFtpList(p);
+        return r.success ? { entries: r.entries ?? [] } : { error: r.error };
+      });
+      setCardUsage(usage);
+    } catch {
+      setCardUsage(null);
+    } finally {
+      setScanning(false);
+    }
+  }, []);
+
   useEffect(() => {
     if (isConnected && protocol === 'mavlink') refreshStorageInfo();
-    else setStorageInfo(null);
+    else { setStorageInfo(null); setCardUsage(null); }
   }, [isConnected, protocol, refreshStorageInfo]);
 
   const handleEraseLogs = useCallback(async () => {
@@ -234,6 +255,9 @@ export const FilesTab: React.FC = () => {
 
       <SdStorageCard
         storageInfo={storageInfo}
+        cardUsage={cardUsage}
+        scanning={scanning}
+        onScan={scanCard}
         erasing={erasingLogs}
         eraseDone={eraseLogsDone}
         onEraseLogs={() => setEraseLogsOpen(true)}
@@ -533,11 +557,17 @@ function IconAction({
 
 function SdStorageCard({
   storageInfo,
+  cardUsage,
+  scanning,
+  onScan,
   erasing,
   eraseDone,
   onEraseLogs,
 }: {
   storageInfo: { totalBytes: number; usedBytes: number; availableBytes: number } | null;
+  cardUsage: CardUsage | null;
+  scanning: boolean;
+  onScan: () => void;
   erasing: boolean;
   eraseDone: boolean;
   onEraseLogs: () => void;
@@ -546,6 +576,12 @@ function SdStorageCard({
   const pct = hasInfo ? Math.min(100, (storageInfo.usedBytes / storageInfo.totalBytes) * 100) : 0;
   const barColor = pct >= 90 ? 'bg-red-500' : pct >= 75 ? 'bg-amber-500' : 'bg-blue-500';
   const low = hasInfo && pct >= 90;
+  // Proportions of what we can see, since the card's true capacity is unknown.
+  const seen = (cardUsage?.logBytes ?? 0) + (cardUsage?.otherBytes ?? 0);
+  const barSplit = {
+    logPct: seen > 0 ? ((cardUsage?.logBytes ?? 0) / seen) * 100 : 0,
+    otherPct: seen > 0 ? ((cardUsage?.otherBytes ?? 0) / seen) * 100 : 0,
+  };
 
   return (
     <div className="flex-shrink-0 px-4 py-3 rounded-lg bg-surface border border-subtle">
@@ -572,10 +608,47 @@ function SdStorageCard({
                 </p>
               )}
             </>
+          ) : cardUsage ? (
+            <>
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-xs text-content-secondary">
+                  Flight logs: <span className="text-content font-medium">{formatSize(cardUsage.logBytes)}</span>
+                  {' '}in {cardUsage.logCount} file{cardUsage.logCount === 1 ? '' : 's'}
+                </span>
+                <span className="text-xs text-content-secondary">
+                  Other data: <span className="text-content font-medium">{formatSize(cardUsage.otherBytes)}</span>
+                </span>
+              </div>
+              <div className="flex w-full bg-surface-inset rounded-full h-1.5 overflow-hidden">
+                <div className="bg-blue-500 h-1.5" style={{ width: `${barSplit.logPct}%` }} />
+                <div className="bg-amber-500 h-1.5" style={{ width: `${barSplit.otherPct}%` }} />
+              </div>
+              <p className="text-[11px] text-content-tertiary mt-1.5">
+                {formatSize(cardUsage.logBytes + cardUsage.otherBytes)} seen on the card. Capacity is not
+                reported over MAVLink, so subtract this from your card size for free space.
+                {cardUsage.otherBytes > 0 && ' Amber is data log rotation can never delete.'}
+              </p>
+              {cardUsage.unreadable.length > 0 && (
+                <p className="text-[11px] text-amber-400 mt-1">
+                  {cardUsage.unreadable.length} folder{cardUsage.unreadable.length === 1 ? '' : 's'} could not be
+                  read, so the real total is higher.
+                </p>
+              )}
+            </>
           ) : (
-            <span className="text-xs text-content-tertiary">
-              SD card capacity not reported by this firmware
-            </span>
+            <div className="flex items-center gap-3">
+              <span className="text-xs text-content-tertiary">
+                SD card capacity is not reported by ArduPilot.
+              </span>
+              <button
+                onClick={onScan}
+                disabled={scanning}
+                className="px-2 py-1 rounded text-xs text-blue-400 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/30 disabled:opacity-50 transition-colors"
+                data-tip="Walk the card over MAVLink-FTP and total what is on it"
+              >
+                {scanning ? 'Scanning…' : 'Scan card'}
+              </button>
+            </div>
           )}
         </div>
         <button

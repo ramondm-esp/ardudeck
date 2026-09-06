@@ -57,6 +57,8 @@ interface CameraState {
   engineStatus: MediaEngineStatus | null;
 
   // Config actions
+  /** Rebind persisted per-vehicle config from stale vehicle keys (transport id rotates on reconnect) to live ones by sysid suffix. */
+  adoptLiveVehicles: (liveKeys: string[]) => void;
   addSource: (source: CameraSourceConfig) => void;
   updateSource: (id: string, patch: Partial<CameraSourceConfig>) => void;
   removeSource: (id: string) => void;
@@ -97,6 +99,40 @@ export const useCameraStore = create<CameraState>()(
       gimbalAttitude: {},
       gimbalInfo: {},
       engineStatus: null,
+
+      adoptLiveVehicles: (liveKeys) =>
+        set((s) => {
+          const suffix = (k: string) => k.slice(k.indexOf(':'));
+          const live = new Set(liveKeys);
+          const staleKeys = new Set(
+            [
+              ...Object.values(s.sources).map((src) => src.vehicleKey),
+              ...Object.keys(s.selectedByVehicle),
+              ...Object.keys(s.gimbalByVehicle),
+              ...(s.lockedVehicleKey ? [s.lockedVehicleKey] : []),
+            ].filter((k) => !live.has(k)),
+          );
+          // Rebind only unambiguous sysid matches.
+          const rebind = new Map<string, string>();
+          for (const stale of staleKeys) {
+            const matches = liveKeys.filter((lk) => suffix(lk) === suffix(stale));
+            if (matches.length === 1) rebind.set(stale, matches[0]!);
+          }
+          if (rebind.size === 0) return {};
+          const mapKey = (k: string) => rebind.get(k) ?? k;
+          return {
+            sources: Object.fromEntries(
+              Object.entries(s.sources).map(([id, src]) => [id, { ...src, vehicleKey: mapKey(src.vehicleKey) }]),
+            ),
+            selectedByVehicle: Object.fromEntries(
+              Object.entries(s.selectedByVehicle).map(([k, v]) => [mapKey(k), v]),
+            ),
+            gimbalByVehicle: Object.fromEntries(
+              Object.entries(s.gimbalByVehicle).map(([k, v]) => [mapKey(k), v]),
+            ),
+            lockedVehicleKey: s.lockedVehicleKey ? mapKey(s.lockedVehicleKey) : s.lockedVehicleKey,
+          };
+        }),
 
       addSource: (source) =>
         set((s) => ({

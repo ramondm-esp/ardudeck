@@ -49,6 +49,7 @@ import { useConnectionStore } from '../../stores/connection-store';
 
 import { InfoCard } from '../ui/InfoCard';
 import Px4FlightModesConfig from './Px4FlightModesConfig';
+import { SwitchActionsSection } from './switches/SwitchActionsSection';
 import { PresetSelector, type Preset } from '../ui/PresetSelector';
 import {
   FLIGHT_MODE_PRESETS,
@@ -866,6 +867,8 @@ const FlightModesTab: React.FC<FlightModesTabProps> = ({ vehicleCategory = 'copt
           </div>
         </div>
       </div>
+
+      <SwitchActionsSection />
     </div>
   );
 };

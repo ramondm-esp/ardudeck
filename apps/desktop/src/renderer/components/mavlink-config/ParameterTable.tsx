@@ -579,7 +579,10 @@ const ParameterTable: React.FC = () => {
   }, [saveEdit, cancelEdit]);
 
   const displayParams = filteredParameters();
-  const paramCount = parameters.size;
+  // Zero until a full download lands, so "Save to file" cannot write a
+  // backup containing only the handful of connect-time reads.
+  const paramsComplete = useParameterStore((s) => s.downloadState === 'complete');
+  const paramCount = paramsComplete ? parameters.size : 0;
   const modified = modifiedCount();
   const nonDefaultCount = nonDefaultCountFn();
   const hasDefaults = hasDefaultsFn();

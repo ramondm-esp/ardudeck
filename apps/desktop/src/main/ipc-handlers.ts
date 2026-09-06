@@ -156,6 +156,7 @@ import { registerMspHandlers, tryMspDetection, startMspTelemetry, stopMspTelemet
 import { initCalibrationHandlers, cleanupCalibrationHandlers, handleCalibrationStatusText, handleCalibrationCommandAck, handleIncomingCommandLong, handleMagCalProgress, handleMagCalReport, isMavlinkCalibrationActive, cancelCalibration, type MavlinkCalibrationDeps } from './calibration/index.js';
 import { initMissionLibraryHandlers, cleanupMissionLibraryHandlers } from './mission-library/index.js';
 import { nextTxSeq } from './tx-sequence.js';
+import { telemetryKeyFor } from './telemetry-routing.js';
 import { MavlinkFtpClient, parseParamPack, PARAM_PCK_PATH, parseFtpPayload } from './mavlink-ftp/index.js';
 import { ingestNamedValueFloat, getScriptHealth, resetHeartbeat, subscribeHealth } from './script-installer/heartbeat-tracker.js';
 import * as scriptRegistry from './script-installer/registry-store.js';
@@ -190,6 +191,7 @@ import { mediaEngine } from './media/media-engine.js';
 import { ardupilotSitlProcess, swarmSitlProcess, ardupilotSitlDownloader, ardupilotRcSender } from './sitl/index.js';
 import { px4SitlProcess, px4SitlDownloader } from './sitl/index.js';
 import { startSimHandoverServer, stopSimHandoverServer } from './sim/sim-handover-server.js';
+import { setupTrainerHandlers } from './trainer/trainer-ipc-handlers.js';
 import { resolveReconnectTarget } from './connection/reconnect-target.js';
 import { orchestratorProcess } from './orchestrator/orchestrator-process.js';
 import {
@@ -1189,8 +1191,8 @@ function resetRcChannelState(): void {
   rcMsg35 = { channels: [], rssi: 0 };
 }
 
-function queueMavlinkTelemetry(mainWindow: BrowserWindow, fields: Record<string, unknown>) {
-  const batch = (mavlinkTelemetryBatches[parseVehicleKey] ??= {});
+function queueMavlinkTelemetry(mainWindow: BrowserWindow, fields: Record<string, unknown>, vehicleKey?: string) {
+  const batch = (mavlinkTelemetryBatches[vehicleKey ?? parseVehicleKey] ??= {});
   Object.assign(batch, fields);
   if (!mavlinkBatchTimer) {
     mavlinkBatchTimer = setTimeout(() => {
@@ -1948,6 +1950,46 @@ const PARAM_MAX_STALLED_ROUNDS = 10;
 // actual per-param type (originating from the FC-reported PARAM_VALUE type).
 function resolveParamSetType(requestedType: number): number {
   return connectionState.firmware === 'px4' ? requestedType : 9; // 9 = MAV_PARAM_TYPE_REAL32
+}
+
+/**
+ * Parameters as main sees them. This is the authoritative copy: it is filled by
+ * both the FTP bulk path and the streamed one, and it exists whatever the
+ * renderer is showing. Anything that just wants to READ parameters should come
+ * here rather than through a Zustand store that a view has to be mounted for.
+ */
+export function getVehicleParameters(): {
+  complete: boolean;
+  expected: number;
+  params: Array<{ id: string; value: number; type: number; index: number }>;
+} {
+  return {
+    complete: expectedParamCount > 0 && receivedParams.size >= expectedParamCount,
+    expected: expectedParamCount,
+    params: [...receivedParams.values()].map((p) => ({
+      id: p.paramId,
+      value: p.paramValue,
+      type: p.paramType,
+      index: p.paramIndex,
+    })),
+  };
+}
+
+/** Set once IPC handlers are registered; starts a download from main. */
+let requestAllParametersFromMain:
+  | (() => Promise<{ success: boolean; error?: string }>)
+  | null = null;
+
+export function requestVehicleParameters(): Promise<{ success: boolean; error?: string }> {
+  if (!requestAllParametersFromMain) {
+    return Promise.resolve({ success: false, error: 'IPC handlers not registered yet' });
+  }
+  return requestAllParametersFromMain();
+}
+
+/** True while a bulk download is running, so callers can wait rather than restart it. */
+export function isParameterDownloadActive(): boolean {
+  return paramDownloadActive || paramRequestInFlight;
 }
 
 // MAVLink FTP client for fast parameter download
@@ -3171,6 +3213,10 @@ function parseTelemetry(mainWindow: BrowserWindow, packet: MAVLinkPacket): void 
       // remrssi@5, txbuf@6, noise@7, remnoise@8. Zero-pad: an idle link with
       // zero errors truncates the tail away.
       const p = padTo(payload, 9);
+      // The modem speaks for itself, not for the autopilot: ELRS sends this
+      // from its own sysid on compid 68, so keying it by sender files the link
+      // quality under a vehicle nobody is watching and the UI reads "--" while
+      // the handset shows 100%.
       queueMavlinkTelemetry(mainWindow, {
         radioStatus: {
           rxErrors: readUint16(p, 0),
@@ -3181,7 +3227,7 @@ function parseTelemetry(mainWindow: BrowserWindow, packet: MAVLinkPacket): void 
           noise: p[7]!,
           remNoise: p[8]!,
         },
-      });
+      }, telemetryKeyFor(msgid, packet.compid, parseVehicleKey, connectionRegistry.getActiveVehicleKey()));
       break;
     }
 
@@ -7178,6 +7224,21 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
 
   // Request all parameters from flight controller
   // Strategy: try MAVLink FTP first (fast), fall back to PARAM_REQUEST_LIST (universal)
+  // Let main-process callers (the MCP test driver) start a download without
+  // going through the renderer. Reading parameters must not depend on which
+  // view happens to be mounted.
+  requestAllParametersFromMain = async () => {
+    if (!currentTransport?.isOpen || !connectionState.isConnected) {
+      return { success: false, error: 'Not connected' };
+    }
+    if (detectedMavlinkVersion === 2 && connectionState.firmware !== 'px4') {
+      try {
+        if (await requestParamsViaFtp()) return { success: true };
+      } catch { /* fall through to the streamed path */ }
+    }
+    return requestParamsTraditional();
+  };
+
   ipcMain.handle(IPC_CHANNELS.PARAM_REQUEST_ALL, async (): Promise<{ success: boolean; error?: string }> => {
     if (!currentTransport?.isOpen || !connectionState.isConnected) {
       return { success: false, error: 'Not connected' };
@@ -12537,6 +12598,33 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
     log: (level, message) => sendLog(mainWindow, level, message),
   }).catch((err) => {
     console.warn('[sim-handover] endpoint failed to start:', err);
+  });
+
+  // Fly what is planned here, in the Trainer. Unlike the endpoint above, ArduDeck is the one
+  // SPAWNING the simulator on this path, so there is nothing to negotiate: it keeps the flight
+  // controller by construction and the Trainer is told so.
+  setupTrainerHandlers(mainWindow, {
+    home: () => {
+      const at = ardupilotSitlProcess.currentConfig?.homeLocation ?? null;
+      // `lng` here, `lon` on the wire. One rename, at the boundary, rather than two spellings
+      // travelling together for the rest of the journey.
+      return at ? { lat: at.lat, lon: at.lng, altM: at.alt, headingDeg: at.heading } : null;
+    },
+    frame: () => ({
+      frameClass: ardupilotSitlProcess.simFrame?.frameClass ?? null,
+      frameType: ardupilotSitlProcess.simFrame?.frameType ?? null,
+      framePath: ardupilotSitlProcess.simFramePath ?? null,
+    }),
+    releasePhysics: async () => {
+      if (lastReportedArmed === true) return false;
+      // Marked externally owned BEFORE stopping, so nothing in the SITL lifecycle can race in
+      // and respawn the engine onto UDP 9002. Same order as the hand over, for the same reason.
+      ardupilotSitlProcess.setEngineManaged(false);
+      simEngineProcess.stop();
+      ardupilotRcSender.setExternalOwner(true);
+      return true;
+    },
+    log: (level, message) => sendLog(mainWindow, level, message),
   });
 
   // NTRIP client for RTK corrections (issue #60)

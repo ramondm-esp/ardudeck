@@ -23,6 +23,7 @@ import {
   toMetersFromAltitudeUnit,
   UNIT_LABELS,
 } from '../../../shared/user-units.js';
+import { TrainerQuickAction } from '../trainer/TrainerQuickAction';
 
 const VEHICLE_TYPE_OPTIONS: Array<{ value: ArduPilotVehicleType; label: string; icon: string }> = [
   { value: 'copter', label: 'Copter', icon: 'M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5' },
@@ -626,6 +627,11 @@ export default function ArduPilotSitlTab() {
                 </svg>
                 {isRunning || swarmRunning ? 'Open 3D World' : isStarting ? 'Starting…' : 'Start SITL & Open 3D World'}
               </button>
+
+              {/* The third "watch it" surface, and the only one that keeps THIS flight
+                  controller: the Trainer is spawned by us, so it serves the physics and never
+                  starts a stack of its own. Absent until its cargo is installed. */}
+              <TrainerQuickAction />
 
               {/* FlightGear viewer — the other "watch it" surface, so both live in
                   one place instead of one being buried under Run 400 lines down.

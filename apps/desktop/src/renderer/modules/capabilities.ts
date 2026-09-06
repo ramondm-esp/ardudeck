@@ -45,6 +45,18 @@ export const MISSION_LIBRARY_CARGO_SLUG = 'com.ardudeck.mission-library';
 // the `com.ardudeck.*` convention used by the other cargo above.
 export const ADVISOR_CARGO_SLUG = 'ardudeck.advisor';
 
+/**
+ * Cargo slug that delivers the ArduDeck Trainer.
+ *
+ * Unlike the other entries here this cargo is INSTALLABLE, not activatable: the view ships in
+ * this app, but the thing it launches is a downloaded bundle. The gate is the same either way,
+ * because it only asks whether the cargo is present and enabled, so a Trainer view with nothing
+ * behind it never appears in the rail.
+ *
+ * Must match `TRAINER_CARGO_SLUG` in `main/trainer/trainer-locator.ts`.
+ */
+export const TRAINER_CARGO_SLUG = 'com.ardudeck.trainer';
+
 export const CAPABILITIES: Capability[] = [
   // Example (not active): { slug: 'com.ardudeck.area-editor', viewId: 'mission' },
   // Fleet Vault: nav view plus every vault surface embedded in other screens
@@ -56,6 +68,8 @@ export const CAPABILITIES: Capability[] = [
   // Pre-Flight Weather Briefing: nav view plus the "View in detail" button on
   // the Vehicle & Status weather card (gated via isWeatherBriefingAvailable).
   { slug: WEATHER_CARGO_SLUG, viewId: 'weather' },
+  // ArduDeck Trainer: the nav view plus its quick action on the SITL screen.
+  { slug: TRAINER_CARGO_SLUG, viewId: 'trainer' },
 ];
 
 const GATED_VIEWS: ReadonlyMap<ViewId, string> = new Map(

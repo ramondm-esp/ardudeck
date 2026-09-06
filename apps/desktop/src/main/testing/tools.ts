@@ -6,6 +6,15 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { TESTING_CHANNELS } from '../../shared/testing-channels';
 
+/**
+ * Lazy: importing ipc-handlers at module load pulls in electron-store, which
+ * needs a live Electron app and breaks anything that imports this file outside
+ * one (the MCP server's own tests, for instance).
+ */
+function paramsApi() {
+  return import('../ipc-handlers.js');
+}
+
 const SCREENSHOT_DIR = join(homedir(), '.ardudeck', 'screenshots');
 mkdirSync(SCREENSHOT_DIR, { recursive: true });
 
@@ -190,16 +199,38 @@ export async function getVehicleSnapshotTool(): Promise<any> {
   };
 }
 
-async function ensureParametersLoaded(): Promise<{ count: number }> {
-  return callRenderer(TESTING_CHANNELS.ENSURE_PARAMETERS_LOADED, { timeout: 45000 });
+/**
+ * Parameters straight from the main process, which holds the authoritative copy
+ * regardless of which view is mounted. Reading them used to go through the
+ * renderer's Zustand store, so it depended on the Parameters screen having been
+ * opened; a fresh download is started here if main has nothing yet.
+ */
+async function ensureParametersLoaded(timeoutMs = 60000): Promise<{ count: number }> {
+  const api = await paramsApi();
+  const snapshot = api.getVehicleParameters();
+  if (snapshot.complete) return { count: snapshot.params.length };
+
+  if (!api.isParameterDownloadActive()) {
+    const res = await api.requestVehicleParameters();
+    if (!res.success) throw new Error(res.error ?? 'Could not start a parameter download');
+  }
+
+  const start = Date.now();
+  for (;;) {
+    const s = api.getVehicleParameters();
+    if (s.complete) return { count: s.params.length };
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(
+        `Timeout after ${timeoutMs}ms: have ${s.params.length} of ${s.expected || 'unknown'} parameters`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
 }
 
 export async function getParameterTool(params: { name: string }): Promise<any> {
   await ensureParametersLoaded();
-  const paramState = await readStore('parameter').catch(() => ({ parameters: {} }));
-  const p = paramState?.parameters;
-  if (!p) return { found: false };
-  const entry = p instanceof Map ? p.get(params.name) : p?.[params.name];
+  const entry = (await paramsApi()).getVehicleParameters().params.find((p) => p.id === params.name);
   if (!entry) return { found: false };
   return { found: true, parameter: entry };
 }
@@ -210,10 +241,7 @@ export async function listParametersTool(params: {
   limit?: number;
 }): Promise<any> {
   await ensureParametersLoaded();
-  const paramState = await readStore('parameter').catch(() => ({ parameters: {} }));
-  const p = paramState?.parameters;
-  if (!p) return { total: 0, items: [] };
-  const all: any[] = p instanceof Map ? Array.from(p.values()) : Object.values(p);
+  const all: any[] = (await paramsApi()).getVehicleParameters().params;
   const pref = params.prefix?.toUpperCase();
   const needle = params.search?.toLowerCase();
   const filtered = all.filter((entry: any) => {

@@ -24,13 +24,15 @@ const PWM_MAX = 2200;
 
 const ServoOutputTab: React.FC = () => {
   const parameters = useParameterStore((s) => s.parameters);
+  const paramsLoaded = useParameterStore((s) => s.downloadState === 'complete');
   const metadata = useParameterStore((s) => s.metadata);
   const setParameter = useParameterStore((s) => s.setParameter);
   const servoOutput = useTelemetryStore((s) => s.servoOutput);
   const lastServoOutput = useTelemetryStore((s) => s.lastServoOutput);
   const firmware = useConnectionStore((s) => s.connectionState.firmware);
 
-  const hasParameters = parameters.size > 0;
+  // A completed download, not just whatever parameters happen to be present.
+  const hasParameters = paramsLoaded && parameters.size > 0;
 
   // 32 channels if SERVO_32_ENABLE param is present and truthy, else 16.
   const channelCount = useMemo(() => {

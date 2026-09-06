@@ -35,3 +35,49 @@ describe('osdBackdropSource', () => {
     expect(osdBackdropSource(s, 'veh1')).toEqual(a);
   });
 });
+
+import { useCameraStore } from './camera-store';
+
+describe('adoptLiveVehicles', () => {
+  it('rebinds sources, selection, gimbal, and lock from stale transport keys', () => {
+    const stale = 'old-transport:5.1';
+    const live = 'new-transport:5.1';
+    useCameraStore.setState({
+      sources: { cam: src('cam', stale) },
+      selectedByVehicle: { [stale]: 'cam' },
+      gimbalByVehicle: { [stale]: { kind: 'mavlink' } as never },
+      lockedVehicleKey: stale,
+    });
+    useCameraStore.getState().adoptLiveVehicles([live, 'new-transport:6.1']);
+    const s = useCameraStore.getState();
+    expect(s.sources['cam']!.vehicleKey).toBe(live);
+    expect(s.selectedByVehicle[live]).toBe('cam');
+    expect(s.selectedByVehicle[stale]).toBeUndefined();
+    expect(s.gimbalByVehicle[live]).toBeTruthy();
+    expect(s.lockedVehicleKey).toBe(live);
+  });
+
+  it('leaves ambiguous sysid matches alone', () => {
+    const stale = 'old:5.1';
+    useCameraStore.setState({
+      sources: { cam: src('cam', stale) },
+      selectedByVehicle: { [stale]: 'cam' },
+      gimbalByVehicle: {},
+      lockedVehicleKey: null,
+    });
+    useCameraStore.getState().adoptLiveVehicles(['a:5.1', 'b:5.1']);
+    expect(useCameraStore.getState().sources['cam']!.vehicleKey).toBe(stale);
+  });
+
+  it('does not touch keys that are already live', () => {
+    const live = 't:5.1';
+    useCameraStore.setState({
+      sources: { cam: src('cam', live) },
+      selectedByVehicle: { [live]: 'cam' },
+      gimbalByVehicle: {},
+      lockedVehicleKey: null,
+    });
+    useCameraStore.getState().adoptLiveVehicles([live]);
+    expect(useCameraStore.getState().sources['cam']!.vehicleKey).toBe(live);
+  });
+});

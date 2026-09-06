@@ -325,12 +325,14 @@ const Px4SafetyConfig: React.FC<{
 };
 
 const SafetyTab: React.FC = () => {
-  const { parameters, setParameter, modifiedCount, fetchParameters, isLoading } = useParameterStore();
+  const { parameters, setParameter, modifiedCount, fetchParameters, isLoading, downloadState } = useParameterStore();
   const getParameterMetadata = useParameterStore((s) => s.getParameterMetadata);
   const firmware = useConnectionStore((s) => s.connectionState.firmware);
 
-  // Check if parameters are loaded
-  const hasParameters = parameters.size > 0;
+  // A completed download, not just whatever parameters happen to be present:
+  // connect-time batch reads leave a handful behind and the tab would render
+  // its fields against those.
+  const hasParameters = downloadState === 'complete' && parameters.size > 0;
 
   // Transient inline error for failed parameter writes (no toast reachable from this tab)
   const [writeError, setWriteError] = useState<string | null>(null);

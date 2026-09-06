@@ -85,6 +85,17 @@ const navItems: NavItem[] = [
     ),
   },
   {
+    id: 'trainer',
+    label: 'Trainer',
+    icon: (
+      <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round">
+        <path d="M12 3v18" />
+        <path d="M2 10l10-2 10 2-10 3z" />
+        <path d="M8 21h8" />
+      </svg>
+    ),
+  },
+  {
     id: 'settings',
     label: 'Settings',
     icon: (

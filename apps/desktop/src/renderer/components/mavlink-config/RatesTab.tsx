@@ -27,10 +27,12 @@ import { detectRateScheme, buildRatePresetParams, type RateScheme } from './mavl
 const RATE_PROFILES_KEY = 'ardudeck_mavlink_rate_profiles';
 
 const RatesTab: React.FC = () => {
-  const { parameters, setParameter, fetchParameters, isLoading } = useParameterStore();
+  const { parameters, setParameter, fetchParameters, isLoading, downloadState } = useParameterStore();
 
-  // Check if parameters are loaded
-  const hasParameters = parameters.size > 0;
+  // A completed download, not just whatever parameters happen to be present:
+  // connect-time batch reads leave a handful behind and the tab would render
+  // its fields against those.
+  const hasParameters = downloadState === 'complete' && parameters.size > 0;
 
   // Auto-detect rate scheme
   const scheme = useMemo((): RateScheme | null => {

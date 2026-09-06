@@ -19,10 +19,10 @@ import { DraggableSlider } from '../ui/DraggableSlider';
 import { InfoCard } from '../ui/InfoCard';
 
 const TuningTab: React.FC = () => {
-  const { parameters, setParameter, modifiedCount, fetchParameters, isLoading } = useParameterStore();
+  const { parameters, setParameter, modifiedCount, fetchParameters, isLoading, downloadState } = useParameterStore();
 
-  // Check if parameters are loaded
-  const hasParameters = parameters.size > 0;
+  // A completed download, not just whatever parameters happen to be present.
+  const hasParameters = downloadState === 'complete' && parameters.size > 0;
 
   // Get current tuning values
   const tuningValues = useMemo(() => ({

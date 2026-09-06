@@ -771,6 +771,11 @@ export const IPC_CHANNELS = {
    */
   INSPECTOR_BROADCAST: 'inspector:broadcast',
 
+  // ArduDeck Trainer: fly what is planned here, in the simulator, without leaving the app.
+  TRAINER_STATUS: 'trainer:status',
+  TRAINER_LAUNCH: 'trainer:launch',
+  TRAINER_LOG: 'trainer:log',
+
   // Map overlays
   OVERLAY_GET_RADAR_META: 'overlay:get-radar-meta',
   OVERLAY_GET_AIRSPACE: 'overlay:get-airspace',

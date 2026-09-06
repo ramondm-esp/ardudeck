@@ -31,6 +31,7 @@ import type { CalibrationData, CalibrationProgressEvent, CalibrationCompleteEven
 import type { MissionSummary, StoredMission, SaveMissionPayload, FlightLog, MissionListFilter, MissionSortOptions } from '../shared/mission-library-types.js';
 import type { DroneBridgeInfo, DroneBridgeStats, DroneBridgeSettings, DroneBridgeClients, DroneBridgeDetected } from '../shared/dronebridge-types.js';
 import type { RainViewerMeta, AirspaceData, AirportData, GeocodeResult } from '../shared/overlay-types.js';
+import type { TrainerLaunchInput, TrainerStatus } from '../shared/trainer-types.js';
 import type { WindField, WindFetchParams } from '../shared/wind-types.js';
 
 type TelemetryUpdate =
@@ -2508,6 +2509,19 @@ const api = {
       callback(event);
     ipcRenderer.on(IPC_CHANNELS.INSPECTOR_BROADCAST, handler);
     return () => ipcRenderer.removeListener(IPC_CHANNELS.INSPECTOR_BROADCAST, handler);
+  },
+
+  // ─── ArduDeck Trainer ───
+  trainerStatus: (): Promise<TrainerStatus> => ipcRenderer.invoke(IPC_CHANNELS.TRAINER_STATUS),
+  trainerLaunch: (
+    input?: TrainerLaunchInput,
+  ): Promise<{ ok: boolean; error?: string; pid?: number; configPath?: string }> =>
+    ipcRenderer.invoke(IPC_CHANNELS.TRAINER_LAUNCH, input ?? {}),
+  /** Trainer output while it starts. Returns an unsubscribe function. */
+  onTrainerLog: (callback: (line: string) => void): (() => void) => {
+    const handler = (_: unknown, line: string) => callback(line);
+    ipcRenderer.on(IPC_CHANNELS.TRAINER_LOG, handler);
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.TRAINER_LOG, handler);
   },
 
   // Map overlays

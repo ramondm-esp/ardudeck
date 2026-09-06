@@ -72,6 +72,12 @@ export function CameraPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Transport ids rotate on reconnect, orphaning exact-key lookups.
+  const fleetKeys = useMemo(() => fleet.map((v) => v.key).sort().join('|'), [fleet]);
+  useEffect(() => {
+    if (fleetKeys.length > 0) useCameraStore.getState().adoptLiveVehicles(fleetKeys.split('|'));
+  }, [fleetKeys]);
+
   // The vehicle this panel is bound to (lock wins, else the active selection).
   const targetKey = lockedVehicleKey ?? activeVehicleKey;
   const targetVehicle = useMemo(() => fleet.find((v) => v.key === targetKey) ?? null, [fleet, targetKey]);

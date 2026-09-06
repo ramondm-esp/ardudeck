@@ -354,12 +354,15 @@ export const MavlinkConfigView: React.FC = () => {
     setTimeout(() => setToast(null), type === 'error' ? 8000 : 3000);
   }, []);
 
-  // Load parameters on mount if not loaded
+  // Load parameters on mount unless a full set is already in hand. Keyed on
+  // the download state, not the count: connect-time batch reads leave a few
+  // parameters behind and a count check reads those as "already loaded".
+  const needsFetch = useParameterStore((s) => s.needsParameterFetch());
   useEffect(() => {
-    if (connectionState.isConnected && paramCount === 0 && !isLoading) {
+    if (connectionState.isConnected && needsFetch) {
       fetchParameters();
     }
-  }, [connectionState.isConnected, paramCount, isLoading, fetchParameters]);
+  }, [connectionState.isConnected, needsFetch, fetchParameters]);
 
   const handleWriteToFlashClick = useCallback(() => {
     setShowWriteConfirm(true);

@@ -17,10 +17,11 @@ export function DriftBadge({ profile }: DriftBadgeProps) {
   const isConnected = useConnectionStore(s => s.connectionState.isConnected);
   const isSitl = useConnectionStore(s => s.connectionState.isSitl ?? false);
   const parameters = useParameterStore(s => s.parameters);
+  const paramsLoaded = useParameterStore(s => s.downloadState === 'complete');
   const [open, setOpen] = useState(false);
 
   const report = useMemo(() => {
-    if (!isConnected || parameters.size === 0) return { notApplied: true, diverged: [] };
+    if (!isConnected || !paramsLoaded || parameters.size === 0) return { notApplied: true, diverged: [] };
     const map = new Map<string, { value: number; type: number }>();
     for (const [k, v] of parameters) map.set(k, { value: v.value, type: v.type });
     return computeDrift({
@@ -28,7 +29,7 @@ export function DriftBadge({ profile }: DriftBadgeProps) {
       currentParams: map,
       includeSim: isSitl,
     });
-  }, [profile, parameters, isConnected, isSitl]);
+  }, [profile, parameters, paramsLoaded, isConnected, isSitl]);
 
   if (report.notApplied) return null;
   if (report.diverged.length === 0) return null;
