@@ -114,7 +114,10 @@ jobs:
             apps/desktop/release/*.blockmap
 
   build-mac-arm64:
-    runs-on: macos-latest
+    # Pinned: the macos-26-arm64 image build 20260831.0337 (current macos-latest)
+    # breaks electron-builder's temp keychain (SecKeychainUnlock on
+    # set-key-partition-list); 20260728 was fine. Re-evaluate on the next image roll.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
