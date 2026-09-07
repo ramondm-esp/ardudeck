@@ -226,7 +226,9 @@ export function FlightControlInstrument(): JSX.Element {
 
   // Mode picker popover.
   const [pickerOpen, setPickerOpen] = useState(false);
-  const [pickerPos, setPickerPos] = useState<{ top: number; left: number; maxHeight: number } | null>(null);
+  const [pickerPos, setPickerPos] = useState<
+    { top?: number; bottom?: number; left: number; maxHeight: number } | null
+  >(null);
   const pillRef = useRef<HTMLButtonElement>(null);
   useLayoutEffect(() => {
     if (!pickerOpen) { setPickerPos(null); return; }
@@ -239,8 +241,12 @@ export function FlightControlInstrument(): JSX.Element {
     if (spaceBelow >= 220 || spaceBelow >= spaceAbove) {
       setPickerPos({ top: r.bottom + 6, left, maxHeight: Math.max(160, spaceBelow) });
     } else {
-      const maxHeight = Math.max(160, spaceAbove);
-      setPickerPos({ top: Math.max(8, r.top - 6 - maxHeight), left, maxHeight });
+      // Bottom-anchored when opening up, or a short popup strands at screen top.
+      setPickerPos({
+        bottom: window.innerHeight - r.top + 6,
+        left,
+        maxHeight: Math.max(160, spaceAbove),
+      });
     }
   }, [pickerOpen]);
 
@@ -505,7 +511,13 @@ export function FlightControlInstrument(): JSX.Element {
             <div className="fixed inset-0 z-[9998]" onClick={() => setPickerOpen(false)} />
             <div
               className="fixed z-[9999] rounded-lg bg-surface-solid border border-subtle shadow-xl overflow-y-auto"
-              style={{ top: pickerPos.top, left: pickerPos.left, width: PICKER_WIDTH, maxHeight: pickerPos.maxHeight }}
+              style={{
+                top: pickerPos.top,
+                bottom: pickerPos.bottom,
+                left: pickerPos.left,
+                width: PICKER_WIDTH,
+                maxHeight: pickerPos.maxHeight,
+              }}
             >
               {GROUP_ORDER.map((group) => {
                 const modes = activeModes.filter((m) => m.group === group);

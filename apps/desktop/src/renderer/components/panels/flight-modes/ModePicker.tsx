@@ -84,6 +84,8 @@ function ModePickerImpl({
       const el = anchorRef.current;
       if (!el) return;
       const r = el.getBoundingClientRect();
+      // Zero rect = hidden anchor; placing against it strands the popup at the origin.
+      if (r.width === 0 && r.height === 0) return;
       const width = Math.max(r.width, PANEL_W);
       const left = Math.min(Math.max(8, r.left), window.innerWidth - width - 8);
       const desired = wrapRef.current?.offsetHeight || 360;
@@ -91,7 +93,8 @@ function ModePickerImpl({
       const spaceAbove = r.top - 12;
       const openUp = spaceBelow < Math.min(desired, 260) && spaceAbove > spaceBelow;
       const maxH = Math.max(160, Math.min(desired, openUp ? spaceAbove : spaceBelow, 440));
-      const top = openUp ? Math.max(8, r.top - maxH - 6) : r.bottom + 6;
+      const rawTop = openUp ? r.top - maxH - 6 : r.bottom + 6;
+      const top = Math.min(Math.max(8, rawTop), Math.max(8, window.innerHeight - maxH - 8));
       setPos((prev) =>
         prev && Math.abs(prev.top - top) < 1 && Math.abs(prev.left - left) < 1
           && Math.abs(prev.width - width) < 1 && Math.abs(prev.maxH - maxH) < 1

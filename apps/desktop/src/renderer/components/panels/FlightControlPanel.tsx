@@ -584,7 +584,9 @@ function MavlinkFlightControl({ mavTypeOverride }: { mavTypeOverride?: number })
   }, []);
   const prevArmedRef = useRef(flight.armed);
   const [pickerOpen, setPickerOpen] = useState(false);
-  const modeAnchorRef = useRef<HTMLDivElement>(null);
+  // Per render site: a shared ref binds to only one site when both are mounted.
+  const modeAnchorCompactRef = useRef<HTMLDivElement>(null);
+  const modeAnchorFullRef = useRef<HTMLDivElement>(null);
   const [showTakeoffDialog, setShowTakeoffDialog] = useState(false);
   const [showMissionUploadGate, setShowMissionUploadGate] = useState(false);
   const [uploadingMission, setUploadingMission] = useState(false);
@@ -938,8 +940,10 @@ function MavlinkFlightControl({ mavTypeOverride }: { mavTypeOverride?: number })
   // Shared annunciator + picker block. `compact` = single-line pill for the
   // horizontal command bar (matches the other controls' height); the tall dock
   // uses the full two-line readout.
-  const renderModeControl = (compact: boolean) => (
-    <div className={`relative ${compact ? 'h-full' : ''}`} ref={modeAnchorRef}>
+  const renderModeControl = (compact: boolean) => {
+    const anchorRef = compact ? modeAnchorCompactRef : modeAnchorFullRef;
+    return (
+    <div className={`relative ${compact ? 'h-full' : ''}`} ref={anchorRef}>
       <ModeAnnunciator
         compact={compact}
         phase={mode.phase}
@@ -953,7 +957,7 @@ function MavlinkFlightControl({ mavTypeOverride }: { mavTypeOverride?: number })
       />
       {pickerOpen && (
         <ModePicker
-          anchorRef={modeAnchorRef}
+          anchorRef={anchorRef}
           vehicleClass={vehicleClass}
           firmware={connectionState.firmware}
           currentModeNum={flight.modeNum}
@@ -968,7 +972,8 @@ function MavlinkFlightControl({ mavTypeOverride }: { mavTypeOverride?: number })
         />
       )}
     </div>
-  );
+    );
+  };
 
   // Poll telemetry state until a condition is met, or timeout.
   // Reads directly from Zustand store (no re-renders).
