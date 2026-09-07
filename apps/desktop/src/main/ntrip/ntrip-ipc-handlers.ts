@@ -25,10 +25,12 @@ import {
   type NtripStatus,
 } from '../../shared/ntrip-types.js';
 import type { GpsData } from '../../shared/telemetry-types.js';
+import type { SerialPortInfo } from '@ardudeck/comms';
 import { getApiKey } from '../overlays/overlay-ipc-handlers.js';
 import { NtripClient, fetchSourcetable } from './ntrip-client.js';
+import { LocalBaseSource } from './local-base-source.js';
 import { buildGgaSentence } from './gga.js';
-import { fragmentRtcm, type RtcmInjectFragment } from './rtcm.js';
+import { fragmentRtcm, type RtcmFrame, type RtcmInjectFragment } from './rtcm.js';
 
 interface NtripStoreSchema {
   config: NtripConfig;
@@ -48,6 +50,8 @@ export interface NtripHandlerDeps {
   sendGpsRtcm: (fragment: RtcmInjectFragment) => Promise<boolean>;
   /** Fresh vehicle GPS for GGA upload, or null when unavailable/stale. */
   getGgaPosition: () => GpsData | null;
+  /** Serial ports free for the local base picker (MAVLink-occupied excluded). */
+  listAvailableSerialPorts: () => Promise<SerialPortInfo[]>;
 }
 
 /**
@@ -63,6 +67,7 @@ export interface NtripOrchestratorRemote {
 }
 
 let client: NtripClient | null = null;
+let localBase: LocalBaseSource | null = null;
 /** Non-null while an orchestration link is up: the engine owns NTRIP. */
 let remote: NtripOrchestratorRemote | null = null;
 /** Latest status pushed by the engine's client, served while remote owns it. */
@@ -91,11 +96,19 @@ export function setNtripOrchestrator(r: NtripOrchestratorRemote | null): void {
     if (local && local.state !== 'disconnected' && local.state !== 'error') {
       client?.disconnect();
     }
+    // Same invariant for the serial base: one injector per vehicle.
+    if (localBase?.isStreaming()) localBase.disconnect();
     r.requestStatus();
   } else {
-    // Engine gone: the panel falls back to the local client's view.
-    if (client) pushStatus({ ...client.getStatus(), owner: 'local' });
+    // Engine gone: the panel falls back to the active local source's view.
+    const source = activeLocalSource();
+    if (source) pushStatus({ ...source.getStatus(), owner: 'local' });
   }
+}
+
+/** The provider the persisted source setting points at ('ntrip' or 'serial'). */
+function activeLocalSource(): NtripClient | LocalBaseSource | null {
+  return loadConfig().source === 'serial' ? localBase : client;
 }
 
 /** Status push from the engine's NTRIP client, relayed by ipc-handlers. */
@@ -105,41 +118,51 @@ export function pushOrchestratorNtripStatus(status: NtripStatus): void {
 }
 
 export function setupNtripHandlers(_mainWindow: BrowserWindow, deps: NtripHandlerDeps): void {
+  // One injector for both sources: sequence + chain are per-vehicle state.
+  const injectFrame = (frame: RtcmFrame, note: (ok: boolean) => void) => {
+    const fragments = fragmentRtcm(frame.bytes, rtcmSequence++);
+    if (fragments.length === 0) {
+      // Oversize for the 4-fragment GPS_RTCM_DATA envelope; should not
+      // happen with standard RTCM3 correction messages.
+      note(false);
+      return;
+    }
+    injectChain = injectChain.then(async () => {
+      let ok = true;
+      for (const fragment of fragments) {
+        try {
+          if (!(await deps.sendGpsRtcm(fragment))) ok = false;
+        } catch {
+          ok = false;
+        }
+      }
+      note(ok);
+    });
+  };
+  // While the engine owns NTRIP the local sources are inert; suppress their
+  // pushes so a trailing 'disconnected' cannot clobber the engine's status.
+  const pushLocalStatus = (status: NtripStatus) => {
+    if (!remote) pushStatus({ ...status, owner: 'local' });
+  };
+
   client = new NtripClient({
     getPassword: () => getApiKey('ntrip') ?? '',
     getGga: () => {
       const gps = deps.getGgaPosition();
       return gps ? buildGgaSentence(gps) : null;
     },
-    onRtcmFrame: (frame) => {
-      const fragments = fragmentRtcm(frame.bytes, rtcmSequence++);
-      const c = client;
-      if (fragments.length === 0) {
-        // Oversize for the 4-fragment GPS_RTCM_DATA envelope; should not
-        // happen with standard RTCM3 correction messages.
-        c?.noteInjection(false);
-        return;
-      }
-      injectChain = injectChain.then(async () => {
-        let ok = true;
-        for (const fragment of fragments) {
-          try {
-            if (!(await deps.sendGpsRtcm(fragment))) ok = false;
-          } catch {
-            ok = false;
-          }
-        }
-        c?.noteInjection(ok);
-      });
-    },
-    // While the engine owns NTRIP the local client is inert; suppress its
-    // pushes so a trailing 'disconnected' cannot clobber the engine's status.
-    onStatus: (status) => {
-      if (!remote) pushStatus({ ...status, owner: 'local' });
-    },
+    onRtcmFrame: (frame) => injectFrame(frame, (ok) => client?.noteInjection(ok)),
+    onStatus: pushLocalStatus,
+  });
+
+  localBase = new LocalBaseSource({
+    onRtcmFrame: (frame) => injectFrame(frame, (ok) => localBase?.noteInjection(ok)),
+    onStatus: pushLocalStatus,
   });
 
   ipcMain.handle(IPC_CHANNELS.NTRIP_GET_CONFIG, () => loadConfig());
+
+  ipcMain.handle(IPC_CHANNELS.NTRIP_LIST_SERIAL_PORTS, () => deps.listAvailableSerialPorts());
 
   ipcMain.handle(IPC_CHANNELS.NTRIP_SET_CONFIG, (_e, config: NtripConfig) => {
     configStore.set('config', { ...loadConfig(), ...config });
@@ -148,12 +171,25 @@ export function setupNtripHandlers(_mainWindow: BrowserWindow, deps: NtripHandle
 
   ipcMain.handle(IPC_CHANNELS.NTRIP_CONNECT, () => {
     const config = loadConfig();
+    if (config.source === 'serial') {
+      if (remote) {
+        // Two injectors interleaving GPS_RTCM_DATA sequences corrupts reassembly.
+        return {
+          success: false,
+          error: 'The multi-vehicle engine owns RTK corrections while connected. Local base injection through the engine is not supported yet; use an NTRIP caster or stop the engine.',
+        };
+      }
+      client?.disconnect();
+      rtcmSequence = 0;
+      return localBase!.connect(config);
+    }
     if (remote) {
       if (!config.host) return { success: false, error: 'Caster host is not set' };
       if (!config.mountpoint) return { success: false, error: 'Mountpoint is not set' };
       remote.connect(config, getApiKey('ntrip') ?? '');
       return { success: true };
     }
+    localBase?.disconnect();
     rtcmSequence = 0;
     return client!.connect(config);
   });
@@ -164,11 +200,13 @@ export function setupNtripHandlers(_mainWindow: BrowserWindow, deps: NtripHandle
       return;
     }
     client?.disconnect();
+    localBase?.disconnect();
   });
 
   ipcMain.handle(IPC_CHANNELS.NTRIP_GET_STATUS, (): NtripStatus => {
     if (remote) return remoteStatus;
-    return { ...client!.getStatus(), owner: 'local' };
+    const source = activeLocalSource() ?? client!;
+    return { ...source.getStatus(), owner: 'local' };
   });
 
   ipcMain.handle(
@@ -181,7 +219,8 @@ export function setupNtripHandlers(_mainWindow: BrowserWindow, deps: NtripHandle
   );
 }
 
-/** Drop the caster connection on app shutdown. */
+/** Drop the caster/base connection on app shutdown. */
 export function cleanupNtrip(): void {
   client?.disconnect();
+  localBase?.disconnect();
 }

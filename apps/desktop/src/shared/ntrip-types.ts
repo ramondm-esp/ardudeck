@@ -16,7 +16,16 @@
  */
 export type NtripProtocol = 'auto' | 'v1' | 'v2';
 
+/** Corrections source: internet caster, or a local base receiver on serial. */
+export type RtkSource = 'ntrip' | 'serial';
+
 export interface NtripConfig {
+  /** Active corrections source (see RtkSource). */
+  source: RtkSource;
+  /** Serial device path of the local base receiver ('serial' source). */
+  serialPath: string;
+  /** Baud rate of the local base receiver ('serial' source). */
+  serialBaud: number;
   /** Caster hostname or IP, without scheme. */
   host: string;
   /** Caster port. NTRIP convention is 2101 (80/443 for HTTP-fronted casters). */
@@ -39,6 +48,9 @@ export interface NtripConfig {
 }
 
 export const DEFAULT_NTRIP_CONFIG: NtripConfig = {
+  source: 'ntrip',
+  serialPath: '',
+  serialBaud: 115200,
   host: '',
   port: 2101,
   protocol: 'auto',
@@ -88,6 +100,10 @@ export interface NtripStatus {
   connectedAtMs?: number;
   /** Which client this status describes (see NtripOwner). */
   owner?: NtripOwner;
+  /** Which corrections source produced this status (see RtkSource). */
+  source?: RtkSource;
+  /** Base station position from RTCM 1005/1006, when the stream carries one. */
+  basePosition?: { lat: number; lon: number; altM: number };
   /** Orchestrator only: RTCM messages forwarded per vehicle, by virtual sysid. */
   perVehicleForwarded?: Record<number, number>;
 }

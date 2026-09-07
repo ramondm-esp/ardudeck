@@ -2569,6 +2569,8 @@ const api = {
     ipcRenderer.invoke(IPC_CHANNELS.NTRIP_GET_SOURCETABLE),
   ntripGetStatus: (): Promise<NtripStatus> =>
     ipcRenderer.invoke(IPC_CHANNELS.NTRIP_GET_STATUS),
+  ntripListSerialPorts: (): Promise<SerialPortInfo[]> =>
+    ipcRenderer.invoke(IPC_CHANNELS.NTRIP_LIST_SERIAL_PORTS),
   /** Subscribe to NTRIP status pushes. Returns an unsubscribe function. */
   onNtripStatus: (callback: (status: NtripStatus) => void): (() => void) => {
     const handler = (_: unknown, status: NtripStatus) => callback(status);

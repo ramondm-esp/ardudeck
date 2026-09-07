@@ -12644,6 +12644,11 @@ export function setupIpcHandlers(mainWindow: BrowserWindow): void {
       if (Date.now() - lastGpsRawForNtrip.atMs > 10000) return null;
       return lastGpsRawForNtrip.gps;
     },
+    listAvailableSerialPorts: async () => {
+      const ports = await listSerialPorts();
+      const busyPath = currentTransport?.isOpen ? currentTransport.portName : null;
+      return busyPath ? ports.filter((p) => p.path !== busyPath) : ports;
+    },
   });
 
   // === Log Download & Diagnostics ===

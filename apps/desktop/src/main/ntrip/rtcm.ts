@@ -95,6 +95,72 @@ export class RtcmFramer {
   }
 }
 
+/** Reads big-endian bit fields out of an RTCM payload (fields cross bytes). */
+class BitReader {
+  private pos = 0;
+  constructor(private data: Uint8Array) {}
+
+  read(bits: number): number {
+    return Number(this.readBig(bits));
+  }
+
+  /** Signed two's-complement read (RTCM DF025/026/027 are 38-bit signed). */
+  readSigned(bits: number): number {
+    const raw = this.readBig(bits);
+    const signBit = 1n << BigInt(bits - 1);
+    return Number(raw & signBit ? raw - (signBit << 1n) : raw);
+  }
+
+  private readBig(bits: number): bigint {
+    let value = 0n;
+    for (let i = 0; i < bits; i++) {
+      const byte = this.data[this.pos >> 3];
+      if (byte === undefined) return value << BigInt(bits - i);
+      const bit = (byte >> (7 - (this.pos & 7))) & 1;
+      value = (value << 1n) | BigInt(bit);
+      this.pos++;
+    }
+    return value;
+  }
+}
+
+const WGS84_A = 6378137;
+const WGS84_F = 1 / 298.257223563;
+
+function ecefToGeodetic(x: number, y: number, z: number): { lat: number; lon: number; altM: number } {
+  const a = WGS84_A;
+  const b = a * (1 - WGS84_F);
+  const e2 = WGS84_F * (2 - WGS84_F);
+  const ep2 = (a * a - b * b) / (b * b);
+  const p = Math.sqrt(x * x + y * y);
+  const theta = Math.atan2(z * a, p * b);
+  const lat = Math.atan2(
+    z + ep2 * b * Math.sin(theta) ** 3,
+    p - e2 * a * Math.cos(theta) ** 3,
+  );
+  const n = a / Math.sqrt(1 - e2 * Math.sin(lat) ** 2);
+  const altM = p / Math.cos(lat) - n;
+  return { lat: (lat * 180) / Math.PI, lon: (Math.atan2(y, x) * 180) / Math.PI, altM };
+}
+
+/** Base position from RTCM 1005/1006; null for other types or unsurveyed (all-zero ECEF). */
+export function parseBasePosition(frame: RtcmFrame): { lat: number; lon: number; altM: number } | null {
+  if (frame.type !== 1005 && frame.type !== 1006) return null;
+  const payload = frame.bytes.subarray(3, frame.bytes.length - 3);
+  if (payload.length < 19) return null;
+  const r = new BitReader(payload);
+  r.read(12); // message number
+  r.read(12); // station id
+  r.read(6 + 1 + 1 + 1 + 1); // ITRF year + GPS/GLONASS/Galileo/ref-station flags
+  const x = r.readSigned(38);
+  r.read(1 + 1); // single receiver oscillator + reserved
+  const y = r.readSigned(38);
+  r.read(2); // quarter cycle indicator
+  const z = r.readSigned(38);
+  if (x === 0 && y === 0 && z === 0) return null;
+  return ecefToGeodetic(x * 1e-4, y * 1e-4, z * 1e-4);
+}
+
 export interface RtcmInjectFragment {
   flags: number;
   len: number;

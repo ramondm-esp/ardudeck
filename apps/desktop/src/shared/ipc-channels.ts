@@ -799,6 +799,8 @@ export const IPC_CHANNELS = {
   NTRIP_DISCONNECT: 'ntrip:disconnect',
   NTRIP_GET_SOURCETABLE: 'ntrip:get-sourcetable',
   NTRIP_GET_STATUS: 'ntrip:get-status',
+  NTRIP_LIST_SERIAL_PORTS: 'ntrip:list-serial-ports', // free ports for the local base picker
+
   NTRIP_STATUS: 'ntrip:status', // main -> renderer push of NtripStatus
 
   // Log download & diagnostics

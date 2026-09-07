@@ -38,6 +38,7 @@ import { CompactReadout, type ReadoutSource } from './CompactReadout';
 import { PANEL_WIDTH } from './stripMetrics';
 import { useLinkUp } from './useLinkUp';
 import { useTelemetryFresh } from './useTelemetryFresh';
+import { RtkInstrument } from './RtkInstrument';
 
 /** An alternative rendering of an instrument, chosen per-instrument and
  * persisted alongside the analog/numeric choice. */
@@ -966,5 +967,6 @@ export const MAP_INSTRUMENTS: MapInstrumentDef[] = [
   { id: 'link', label: 'Link', defaultClassName: 'absolute left-[124px] top-[128px] z-[1000]', defaultVisible: false, Component: LinkInstrument, variants: compactVariants('link') },
   { id: 'mission', label: 'Mission', defaultClassName: 'absolute left-[124px] top-[192px] z-[1000]', defaultVisible: false, Component: MissionInstrument },
   { id: 'annunciator', label: 'Annunciator', defaultClassName: 'absolute left-[124px] top-[268px] z-[1000]', defaultVisible: false, Component: AnnunciatorInstrument },
+  { id: 'rtk', label: 'RTK', defaultClassName: 'absolute left-[124px] top-[600px] z-[1000]', defaultVisible: false, Component: RtkInstrument },
   { id: 'controls', label: 'Flight control', defaultClassName: 'absolute left-[124px] top-[420px] z-[1000]', defaultVisible: false, Component: FlightControlInstrument },
 ];

@@ -62,6 +62,7 @@ const INSTRUMENT_ROLE: Record<string, InstrumentRole> = {
   vsi: 'primaryFlight',
   battery: 'power',
   gps: 'navigation',
+  rtk: 'navigation',
   home: 'navigation',
   mission: 'navigation',
   'flight-mode': 'status',

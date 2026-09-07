@@ -11,8 +11,12 @@ import {
   type NtripConfig,
   type NtripMountpoint,
   type NtripStatus,
+  type RtkSource,
 } from '../../../shared/ntrip-types';
+import type { SerialPortInfo } from '@ardudeck/comms';
 import { PanelContainer, SectionTitle, StatRow } from './panel-utils';
+
+const BAUD_RATES = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600];
 
 const STATE_LABEL: Record<NtripStatus['state'], string> = {
   disconnected: 'Disconnected',
@@ -64,6 +68,7 @@ export function NtripPanel() {
   const [mountpoints, setMountpoints] = useState<NtripMountpoint[]>([]);
   const [fetchingTable, setFetchingTable] = useState(false);
   const [tableError, setTableError] = useState<string | null>(null);
+  const [serialPorts, setSerialPorts] = useState<SerialPortInfo[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(true);
   const configRef = useRef(config);
   configRef.current = config;
@@ -82,7 +87,13 @@ export function NtripPanel() {
 
   useEffect(() => {
     let mounted = true;
-    void window.electronAPI.ntripGetConfig().then((c) => mounted && setConfig(c));
+    void window.electronAPI.ntripGetConfig().then((c) => {
+      if (!mounted) return;
+      setConfig(c);
+      if (c.source === 'serial') {
+        void window.electronAPI.ntripListSerialPorts().then((p) => mounted && setSerialPorts(p));
+      }
+    });
     void window.electronAPI.ntripGetStatus().then((s) => mounted && setStatus(s));
     void window.electronAPI.getApiKey('ntrip').then((r) => mounted && setPassword(r.key));
     const unsubscribe = window.electronAPI.onNtripStatus((s) => mounted && setStatus(s));
@@ -96,6 +107,10 @@ export function NtripPanel() {
     const next = { ...configRef.current, ...patch };
     setConfig(next);
     void window.electronAPI.ntripSetConfig(next);
+  };
+
+  const refreshSerialPorts = async () => {
+    setSerialPorts(await window.electronAPI.ntripListSerialPorts());
   };
 
   const savePassword = () => {
@@ -113,7 +128,7 @@ export function NtripPanel() {
     // caster host always has a dot; a bare token matching the fetched
     // sourcetable is certainly the mountpoint.
     const host = configRef.current.host.trim();
-    if (host && !host.includes('.') && mountpoints.some((m) => m.name === host)) {
+    if (configRef.current.source !== 'serial' && host && !host.includes('.') && mountpoints.some((m) => m.name === host)) {
       setStatus((s) => ({
         ...s,
         state: 'error',
@@ -194,7 +209,12 @@ export function NtripPanel() {
           <span className="text-[10px] font-medium text-content-secondary uppercase tracking-wider group-hover:text-content">
             Settings
           </span>
-          {!settingsOpen && config.host && (
+          {!settingsOpen && config.source === 'serial' && config.serialPath && (
+            <span className="text-[11px] text-content-tertiary font-mono truncate">
+              {config.serialPath} @ {config.serialBaud}
+            </span>
+          )}
+          {!settingsOpen && config.source !== 'serial' && config.host && (
             <span className="text-[11px] text-content-tertiary font-mono truncate">
               {config.host}:{config.port}
               {config.mountpoint ? ` / ${config.mountpoint}` : ''}
@@ -203,6 +223,82 @@ export function NtripPanel() {
         </button>
 
         {settingsOpen && (<>
+        {/* Corrections source */}
+        <div>
+          <SectionTitle>Source</SectionTitle>
+          <div className="flex rounded overflow-hidden border border-default w-fit">
+            {([
+              { id: 'ntrip', label: 'NTRIP caster', tip: 'Corrections from an internet caster' },
+              { id: 'serial', label: 'Local base (serial)', tip: 'Corrections from a base receiver plugged into this computer. Works fully offline.' },
+            ] as Array<{ id: RtkSource; label: string; tip: string }>).map((s) => (
+              <button
+                key={s.id}
+                onClick={() => {
+                  persist({ source: s.id });
+                  if (s.id === 'serial') void refreshSerialPorts();
+                }}
+                data-tip={s.tip}
+                className={`px-2.5 py-1 text-xs transition-colors ${
+                  (config.source ?? 'ntrip') === s.id
+                    ? 'bg-blue-500/15 text-blue-400'
+                    : 'bg-surface-input text-content-secondary hover:text-content'
+                }`}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {config.source === 'serial' && (
+        <div>
+          <SectionTitle>Base Station</SectionTitle>
+          <div className="flex gap-2 items-end">
+            <Field label="Serial port" className="flex-1">
+              <select
+                value={config.serialPath}
+                onChange={(e) => persist({ serialPath: e.target.value })}
+                className={`${INPUT_CLASS} font-mono`}
+              >
+                <option value="">Select a port ({serialPorts.length} found)</option>
+                {/* Keep a vanished configured port selectable so the choice survives replug. */}
+                {config.serialPath && !serialPorts.some((p) => p.path === config.serialPath) && (
+                  <option value={config.serialPath}>{config.serialPath} (not present)</option>
+                )}
+                {serialPorts.map((p) => (
+                  <option key={p.path} value={p.path}>
+                    {p.path}
+                    {p.manufacturer ? ` - ${p.manufacturer}` : ''}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Field label="Baud" className="w-24">
+              <select
+                value={config.serialBaud}
+                onChange={(e) => persist({ serialBaud: Number(e.target.value) })}
+                className={INPUT_CLASS}
+              >
+                {BAUD_RATES.map((b) => (
+                  <option key={b} value={b}>{b}</option>
+                ))}
+              </select>
+            </Field>
+            <button
+              onClick={() => void refreshSerialPorts()}
+              data-tip="Rescan serial ports. Ports used by an active vehicle connection are not listed."
+              className="px-2.5 py-1.5 rounded text-xs bg-surface-raised text-content-secondary hover:text-content transition-colors"
+            >
+              Rescan
+            </button>
+          </div>
+          <p className="mt-1.5 text-[11px] text-content-tertiary">
+            The receiver must be configured as a base (surveyed-in or fixed position) and output RTCM3 on this port.
+          </p>
+        </div>
+        )}
+
+        {config.source !== 'serial' && (<>
         {/* Caster config */}
         <div>
           <SectionTitle>Caster</SectionTitle>
@@ -343,6 +439,7 @@ export function NtripPanel() {
           </div>
         </div>
         </>)}
+        </>)}
 
         {/* Stream stats */}
         {(busy || status.bytesReceived > 0) && (
@@ -362,16 +459,24 @@ export function NtripPanel() {
                   <StatRow label="Vehicles receiving" value={Object.keys(status.perVehicleForwarded).length} />
                 )}
               {status.rtcmDropped > 0 && <StatRow label="Dropped" value={status.rtcmDropped} />}
-              <StatRow
-                label="GGA upload"
-                value={
-                  status.ggaState === 'off'
-                    ? 'Off'
-                    : status.ggaState === 'waiting-for-fix'
-                      ? 'Waiting for fix'
-                      : `Sent ${status.ggaSentCount}`
-                }
-              />
+              {status.basePosition && (
+                <StatRow
+                  label="Base position"
+                  value={`${status.basePosition.lat.toFixed(7)}, ${status.basePosition.lon.toFixed(7)} (${status.basePosition.altM.toFixed(1)} m)`}
+                />
+              )}
+              {status.source !== 'serial' && (
+                <StatRow
+                  label="GGA upload"
+                  value={
+                    status.ggaState === 'off'
+                      ? 'Off'
+                      : status.ggaState === 'waiting-for-fix'
+                        ? 'Waiting for fix'
+                        : `Sent ${status.ggaSentCount}`
+                  }
+                />
+              )}
               {typesSummary && (
                 <div className="pt-1">
                   <div className="text-content-secondary text-xs mb-0.5">RTCM messages</div>
